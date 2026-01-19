@@ -8,9 +8,17 @@ import xml.etree.ElementTree as ET
 from urllib.parse import unquote
 
 from azure.storage.blob import BlobClient
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Tableau Metadata Extractor API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],          # allow all HTTP methods
+    allow_headers=["*"],          # allow all headers
+)
 
 # -------------------------------------------------
 # REQUEST MODEL
