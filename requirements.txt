@@ -2,3 +2,5 @@ fastapi
 uvicorn
 azure-storage-blob>=12.19.0
 pydantic
+python-multipart
+ 
