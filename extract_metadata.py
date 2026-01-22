@@ -2,6 +2,7 @@ import json
 import os
 import zipfile
 import tempfile
+import re
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote
 
@@ -48,10 +49,30 @@ class ExtractMetadataRequest(BaseModel):
 # -------------------------------------------------
 
 def clean_name(name: str):
-    """Removes Tableau's internal brackets from field names."""
+    """
+    Cleans Tableau field names.
+    1. Removes brackets [ ]
+    2. Removes internal prefixes like 'none:', 'sum:', 'yr:'
+    3. Removes internal suffixes like ':nk', ':ok', ':qk'
+    """
     if not name:
         return name
-    return name.replace("[", "").replace("]", "")
+    
+    # 1. Remove brackets
+    name = name.replace("[", "").replace("]", "")
+    
+    # 2. Remove Tableau internal patterns (e.g., none:CustomerName:nk -> CustomerName)
+    # This regex looks for "prefix:Name:suffix" or just "prefix:Name"
+    # Common prefixes: none, sum, avg, count, yr, mn, dy, qd, tdc
+    # Common suffixes: nk (nominal key), ok (ordinal key), qk (quantitative key)
+    
+    # Remove start prefixes (case insensitive) followed by a colon
+    name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
+    
+    # Remove end suffixes (case insensitive) preceded by a colon
+    name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
+    
+    return name
 
 def download_blob_to_file(blob_url: str, local_path: str):
     blob = BlobClient.from_blob_url(blob_url)
@@ -199,14 +220,14 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             formatted_columns = []
             for col_name in sorted(list(bound_columns_set)):
                 formatted_columns.append({
-                    "table": "unknown", 
+                    "table": "MainTable", # Force MainTable instead of unknown
                     "column": col_name
                 })
 
             # Append to Metadata (Old Object Structure)
             metadata["worksheets"].append({
                 "name": sheet_name,
-                "visualType": visual_type, # Now populates correctly!
+                "visualType": visual_type, 
                 "columns": formatted_columns
             })
 
@@ -262,4 +283,3 @@ def handle_extraction(payload: ExtractMetadataRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
