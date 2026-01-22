@@ -37,7 +37,9 @@ MARK_MAP = {
     'map': 'Map',
     'ganttbar': 'Gantt Chart',
     'shape': 'Shape Chart',
-    'scatter': 'Scatter Plot'
+    'scatter': 'Scatter Plot',
+    'multipolygon': 'Map', # Fix for filled maps
+    'filledmap': 'Map'
 }
 
 class ExtractMetadataRequest(BaseModel):
@@ -62,10 +64,6 @@ def clean_name(name: str):
     name = name.replace("[", "").replace("]", "")
     
     # 2. Remove Tableau internal patterns (e.g., none:CustomerName:nk -> CustomerName)
-    # This regex looks for "prefix:Name:suffix" or just "prefix:Name"
-    # Common prefixes: none, sum, avg, count, yr, mn, dy, qd, tdc
-    # Common suffixes: nk (nominal key), ok (ordinal key), qk (quantitative key)
-    
     # Remove start prefixes (case insensitive) followed by a colon
     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
     
@@ -151,7 +149,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 
                 tables.append({
                     "tableName": clean_name(table_name),
-                    "columns": [] # Populating columns is tricky in xml, leaving generic
+                    "columns": [] 
                 })
 
             metadata["dataSource"] = {
@@ -177,29 +175,10 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
 
-            # --- SMART VISUAL DETECTION ---
-            # 1. Look for the Mark Class
-            mark_element = worksheet.find(".//pane/mark")
-            raw_mark = mark_element.get('class') if mark_element is not None else "Automatic"
-            
-            # 2. Handle "Automatic" Logic (The Fix for Maps/Text Tables)
-            if raw_mark == "Automatic":
-                # Check if it is a map style
-                if worksheet.find(".//style-rule[@element='map']") is not None:
-                    raw_mark = "map"
-                # Check for text table indicators (common default)
-                elif worksheet.find(".//style-rule[@element='table']") is not None:
-                    raw_mark = "text"
-            
-            # 3. Map to Readable Name
-            visual_type = MARK_MAP.get(raw_mark.lower(), raw_mark.capitalize())
-
-            # --- SMART COLUMN DETECTION ---
+            # --- STEP 1: DETECT COLUMNS (Do this first to help detection) ---
             bound_columns_set = set()
-            # Look into datasource-dependencies to find columns actually used in this sheet
             for dep in worksheet.findall(".//datasource-dependencies"):
                 for col in dep.findall("column-instance"):
-                    # We prefer 'column' attribute, usually formatted like '[column_name]'
                     col_ref = col.get('column')
                     clean_col = None
                     
@@ -209,22 +188,51 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                         if len(parts) > 1:
                             clean_col = clean_name(parts[-1])
                     
-                    # Alternatively use the 'name' attribute if column ref failed
                     if not clean_col: 
                         clean_col = clean_name(col.get('name'))
                         
                     if clean_col:
                         bound_columns_set.add(clean_col)
 
-            # Format Columns for OLD Output Structure (List of Objects)
+            # --- STEP 2: SMART VISUAL DETECTION ---
+            visual_type = "Automatic"
+            
+            # A. Scan ALL panes for a specific mark type (Prioritize non-automatic)
+            #    (Some sheets have multiple panes, we want the one that defines the chart)
+            for mark_element in worksheet.findall(".//pane/mark"):
+                cls = mark_element.get('class')
+                if cls and cls != "Automatic":
+                    visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
+                    break
+            
+            # B. If still Automatic, check Style Rules (Common for Maps/Text)
+            if visual_type == "Automatic":
+                if worksheet.find(".//style-rule[@element='map']") is not None:
+                    visual_type = "Map"
+                elif worksheet.find(".//style-rule[@element='table']") is not None:
+                    visual_type = "Text Table"
+            
+            # C. If STILL Automatic, guess based on Column Names
+            if visual_type == "Automatic":
+                col_list_lower = [c.lower() for c in bound_columns_set]
+                # If columns contain map keywords -> Map
+                if any(x in col for col in col_list_lower for x in ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']):
+                    visual_type = "Map"
+                # If only 1 column -> Text Table
+                elif len(bound_columns_set) == 1:
+                    visual_type = "Text Table"
+                # Default Fallback -> Bar Chart (Tableau's favorite default)
+                else:
+                    visual_type = "Bar Chart"
+
+            # --- STEP 3: FORMAT OUTPUT ---
             formatted_columns = []
             for col_name in sorted(list(bound_columns_set)):
                 formatted_columns.append({
-                    "table": "MainTable", # Force MainTable instead of unknown
+                    "table": "MainTable", # Force MainTable
                     "column": col_name
                 })
 
-            # Append to Metadata (Old Object Structure)
             metadata["worksheets"].append({
                 "name": sheet_name,
                 "visualType": visual_type, 
