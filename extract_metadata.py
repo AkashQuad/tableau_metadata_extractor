@@ -24,17 +24,19 @@ app.add_middleware(
 # CONSTANTS & MODELS
 # -------------------------------------------------
 
+# Map of Tableau internal mark classes to readable visual types
 MARK_MAP = {
     'bar': 'Bar Chart',
     'line': 'Line Chart',
     'area': 'Area Chart',
-    'text': 'Text Table / Crosstab',
+    'text': 'Text Table',
     'circle': 'Scatter Plot',
     'square': 'Heat Map',
     'pie': 'Pie Chart',
     'map': 'Map',
     'ganttbar': 'Gantt Chart',
-    'shape': 'Shape Chart'
+    'shape': 'Shape Chart',
+    'scatter': 'Scatter Plot'
 }
 
 class ExtractMetadataRequest(BaseModel):
@@ -75,7 +77,7 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     return blob.url
 
 # -------------------------------------------------
-# CORE EXTRACTION LOGIC (HYBRID)
+# CORE EXTRACTION LOGIC (HYBRID + SMART VISUAL DETECTION)
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
@@ -126,9 +128,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 table_name = relation.get("table")
                 if not table_name: continue
                 
-                columns = []
-                # Try to find columns defined in relation or metadata
-                # (Simplified for robustness)
                 tables.append({
                     "tableName": clean_name(table_name),
                     "columns": [] # Populating columns is tricky in xml, leaving generic
@@ -157,29 +156,54 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
 
-            # 1. Detect Visual Type (New Logic)
+            # --- SMART VISUAL DETECTION ---
+            # 1. Look for the Mark Class
             mark_element = worksheet.find(".//pane/mark")
-            mark_class = mark_element.get('class') if mark_element is not None else "unknown"
-            visual_type = MARK_MAP.get(mark_class, mark_class.capitalize())
-
-            # 2. Detect Columns (New Logic - cleaner)
-            bound_columns = set()
-            for dep in worksheet.findall(".//datasource-dependencies"):
-                for col in dep.findall("column"):
-                    # Get readable name
-                    raw_name = col.get('caption') or col.get('name')
-                    if raw_name:
-                        bound_columns.add(clean_name(raw_name))
+            raw_mark = mark_element.get('class') if mark_element is not None else "Automatic"
             
-            # 3. Format Columns for OLD Structure (List of Objects)
+            # 2. Handle "Automatic" Logic (The Fix for Maps/Text Tables)
+            if raw_mark == "Automatic":
+                # Check if it is a map style
+                if worksheet.find(".//style-rule[@element='map']") is not None:
+                    raw_mark = "map"
+                # Check for text table indicators (common default)
+                elif worksheet.find(".//style-rule[@element='table']") is not None:
+                    raw_mark = "text"
+            
+            # 3. Map to Readable Name
+            visual_type = MARK_MAP.get(raw_mark.lower(), raw_mark.capitalize())
+
+            # --- SMART COLUMN DETECTION ---
+            bound_columns_set = set()
+            # Look into datasource-dependencies to find columns actually used in this sheet
+            for dep in worksheet.findall(".//datasource-dependencies"):
+                for col in dep.findall("column-instance"):
+                    # We prefer 'column' attribute, usually formatted like '[column_name]'
+                    col_ref = col.get('column')
+                    clean_col = None
+                    
+                    if col_ref:
+                        # Extract just the name: [some_table].[column_name] -> column_name
+                        parts = col_ref.split(']:')
+                        if len(parts) > 1:
+                            clean_col = clean_name(parts[-1])
+                    
+                    # Alternatively use the 'name' attribute if column ref failed
+                    if not clean_col: 
+                        clean_col = clean_name(col.get('name'))
+                        
+                    if clean_col:
+                        bound_columns_set.add(clean_col)
+
+            # Format Columns for OLD Output Structure (List of Objects)
             formatted_columns = []
-            for col_name in bound_columns:
+            for col_name in sorted(list(bound_columns_set)):
                 formatted_columns.append({
-                    "table": "unknown", # Tableau XML rarely explicitly links table in dependencies
+                    "table": "unknown", 
                     "column": col_name
                 })
 
-            # 4. Append to Metadata (Old Object Structure)
+            # Append to Metadata (Old Object Structure)
             metadata["worksheets"].append({
                 "name": sheet_name,
                 "visualType": visual_type, # Now populates correctly!
@@ -238,3 +262,4 @@ def handle_extraction(payload: ExtractMetadataRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
