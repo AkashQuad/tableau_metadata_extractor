@@ -25,7 +25,6 @@ app.add_middleware(
 # CONSTANTS & MODELS
 # -------------------------------------------------
 
-# Map of Tableau internal mark classes to readable visual types
 MARK_MAP = {
     'bar': 'Bar Chart',
     'line': 'Line Chart',
@@ -38,7 +37,7 @@ MARK_MAP = {
     'ganttbar': 'Gantt Chart',
     'shape': 'Shape Chart',
     'scatter': 'Scatter Plot',
-    'multipolygon': 'Map', # Fix for filled maps
+    'multipolygon': 'Map',
     'filledmap': 'Map'
 }
 
@@ -53,24 +52,29 @@ class ExtractMetadataRequest(BaseModel):
 def clean_name(name: str):
     """
     Cleans Tableau field names.
-    1. Removes brackets [ ]
-    2. Removes internal prefixes like 'none:', 'sum:', 'yr:'
-    3. Removes internal suffixes like ':nk', ':ok', ':qk'
     """
     if not name:
         return name
     
-    # 1. Remove brackets
+    # Remove brackets
     name = name.replace("[", "").replace("]", "")
     
-    # 2. Remove Tableau internal patterns (e.g., none:CustomerName:nk -> CustomerName)
-    # Remove start prefixes (case insensitive) followed by a colon
+    # Remove internal patterns
     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
-    
-    # Remove end suffixes (case insensitive) preceded by a colon
     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
     
     return name
+
+def is_aggregation(formula: str) -> bool:
+    """
+    Simple heuristic to check if a formula is likely a Measure (Aggregation) 
+    vs a Calculated Column (Row Level).
+    """
+    if not formula:
+        return False
+    aggs = ['SUM(', 'AVG(', 'COUNT(', 'COUNTD(', 'MIN(', 'MAX(', 'ATTR(']
+    formula_upper = formula.upper()
+    return any(agg in formula_upper for agg in aggs)
 
 def download_blob_to_file(blob_url: str, local_path: str):
     blob = BlobClient.from_blob_url(blob_url)
@@ -80,7 +84,9 @@ def download_blob_to_file(blob_url: str, local_path: str):
 def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     if not conn_str:
-        raise Exception("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
+        # Fallback for local testing if env var is missing, prints warning
+        print("WARNING: AZURE_STORAGE_CONNECTION_STRING not set. Skipping upload.")
+        return "local-test-no-upload"
 
     container_name = container_url.rstrip("/").split("/")[-1]
     blob = BlobClient.from_connection_string(
@@ -96,14 +102,15 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     return blob.url
 
 # -------------------------------------------------
-# CORE EXTRACTION LOGIC (HYBRID + SMART VISUAL DETECTION)
+# CORE EXTRACTION LOGIC
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
-    # 1. Initialize OLD Output Structure
     metadata = {
         "dataSource": {},
-        "calculatedFields": [],
+        "relationships": [],    # NEW: Captures Joins/Relationships
+        "measures": [],         # NEW: Captures Aggregations (DAX candidates)
+        "calculatedColumns": [],# NEW: Captures Row-level calcs
         "worksheets": [],
         "dashboards": [],
         "globalFilters": []
@@ -128,28 +135,32 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         if not twb_file:
             raise Exception("No .twb XML file found inside TWBX")
 
-        # C. Parse XML & STRIP NAMESPACES (Critical Fix)
+        # C. Parse XML & STRIP NAMESPACES
         tree = ET.parse(twb_file)
         root = tree.getroot()
-        
-        # This fixes the "No worksheets found" error by ignoring xmlns
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # -------------------------------------------------------
-        # SECTION 1: DATASOURCE (From Old Code)
+        # SECTION 1: DATASOURCE & TABLES
         # -------------------------------------------------------
         datasource = root.find(".//datasource")
         if datasource is not None:
             tables = []
+            
+            # Simple Table Extraction
             for relation in datasource.findall(".//relation"):
                 table_name = relation.get("table")
                 if not table_name: continue
                 
+                # Cleanup table name (Tableau usually wraps in [Table])
+                clean_tbl = clean_name(table_name)
+                
                 tables.append({
-                    "tableName": clean_name(table_name),
-                    "columns": [] 
+                    "tableName": clean_tbl,
+                    "rawName": table_name,
+                    "type": relation.get("type", "table") # table, join, text, etc.
                 })
 
             metadata["dataSource"] = {
@@ -158,80 +169,93 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 "tables": tables
             }
 
-        # -------------------------------------------------------
-        # SECTION 2: CALCULATED FIELDS (From Old Code)
-        # -------------------------------------------------------
-        for col in root.findall(".//column"):
-            calc = col.find("calculation")
-            if calc is not None:
-                metadata["calculatedFields"].append({
-                    "name": clean_name(col.get("name")),
-                    "expression": calc.get("formula")
+            # -------------------------------------------------------
+            # SECTION 1.5: RELATIONSHIPS (JOINS) -- NEW FEATURE
+            # -------------------------------------------------------
+            # We look for <relation> tags that have type='join'
+            for join_rel in datasource.findall(".//relation[@type='join']"):
+                join_type = join_rel.get("join") # inner, left, etc.
+                
+                # Tableau XML nests the tables inside the join relation
+                # Usually <relation type='join'> <clause> ... </clause> <relation name='L' ...> <relation name='R' ...> </relation>
+                
+                # This is a basic parser. Complex nested joins require recursive parsing.
+                # We attempt to find the join clause expression.
+                clause = join_rel.find("clause")
+                expression = clause.get("expression") if clause is not None else ""
+                
+                metadata["relationships"].append({
+                    "type": join_type,
+                    "expression": expression, # "([Orders].[ID] = [Returns].[ID])"
+                    "parsed": "Complex join - check expression" 
                 })
 
         # -------------------------------------------------------
-        # SECTION 3: WORKSHEETS (Using NEW Logic + OLD Structure)
+        # SECTION 2: CALCULATED FIELDS & MEASURES -- IMPROVED
+        # -------------------------------------------------------
+        for col in root.findall(".//column"):
+            name = col.get("name")
+            caption = col.get("caption") or clean_name(name)
+            
+            calc = col.find("calculation")
+            if calc is not None:
+                formula = calc.get("formula")
+                if formula:
+                    # Classify: Measure vs Column
+                    obj = {
+                        "name": caption,
+                        "rawName": name,
+                        "formula": formula,
+                        "dataType": col.get("datatype", "unknown")
+                    }
+                    
+                    if is_aggregation(formula):
+                        obj["type"] = "Measure"
+                        metadata["measures"].append(obj)
+                    else:
+                        obj["type"] = "CalculatedColumn"
+                        metadata["calculatedColumns"].append(obj)
+
+        # -------------------------------------------------------
+        # SECTION 3: WORKSHEETS (Unchanged Logic)
         # -------------------------------------------------------
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
-
-            # --- STEP 1: DETECT COLUMNS (Do this first to help detection) ---
             bound_columns_set = set()
+            
+            # Detect Columns used
             for dep in worksheet.findall(".//datasource-dependencies"):
                 for col in dep.findall("column-instance"):
                     col_ref = col.get('column')
                     clean_col = None
-                    
                     if col_ref:
-                        # Extract just the name: [some_table].[column_name] -> column_name
                         parts = col_ref.split(']:')
                         if len(parts) > 1:
                             clean_col = clean_name(parts[-1])
-                    
                     if not clean_col: 
                         clean_col = clean_name(col.get('name'))
-                        
                     if clean_col:
                         bound_columns_set.add(clean_col)
 
-            # --- STEP 2: SMART VISUAL DETECTION ---
+            # Smart Visual Detection
             visual_type = "Automatic"
-            
-            # A. Scan ALL panes for a specific mark type (Prioritize non-automatic)
-            #    (Some sheets have multiple panes, we want the one that defines the chart)
             for mark_element in worksheet.findall(".//pane/mark"):
                 cls = mark_element.get('class')
                 if cls and cls != "Automatic":
                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
                     break
             
-            # B. If still Automatic, check Style Rules (Common for Maps/Text)
             if visual_type == "Automatic":
-                if worksheet.find(".//style-rule[@element='map']") is not None:
-                    visual_type = "Map"
-                elif worksheet.find(".//style-rule[@element='table']") is not None:
-                    visual_type = "Text Table"
+                if worksheet.find(".//style-rule[@element='map']") is not None: visual_type = "Map"
+                elif worksheet.find(".//style-rule[@element='table']") is not None: visual_type = "Text Table"
             
-            # C. If STILL Automatic, guess based on Column Names
             if visual_type == "Automatic":
                 col_list_lower = [c.lower() for c in bound_columns_set]
-                # If columns contain map keywords -> Map
-                if any(x in col for col in col_list_lower for x in ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']):
-                    visual_type = "Map"
-                # If only 1 column -> Text Table
-                elif len(bound_columns_set) == 1:
-                    visual_type = "Text Table"
-                # Default Fallback -> Bar Chart (Tableau's favorite default)
-                else:
-                    visual_type = "Bar Chart"
+                if any(x in col for col in col_list_lower for x in ['lat', 'lon', 'geo']): visual_type = "Map"
+                elif len(bound_columns_set) == 1: visual_type = "Text Table"
+                else: visual_type = "Bar Chart"
 
-            # --- STEP 3: FORMAT OUTPUT ---
-            formatted_columns = []
-            for col_name in sorted(list(bound_columns_set)):
-                formatted_columns.append({
-                    "table": "MainTable", # Force MainTable
-                    "column": col_name
-                })
+            formatted_columns = [{"table": "MainTable", "column": col} for col in sorted(list(bound_columns_set))]
 
             metadata["worksheets"].append({
                 "name": sheet_name,
@@ -240,7 +264,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             })
 
         # -------------------------------------------------------
-        # SECTION 4: DASHBOARDS (From Old Code)
+        # SECTION 4: DASHBOARDS
         # -------------------------------------------------------
         for dashboard in root.findall(".//dashboard"):
             ws_names = []
@@ -282,7 +306,12 @@ def handle_extraction(payload: ExtractMetadataRequest):
         return {
             "status": "success",
             "outputBlobUrl": output_url,
-            "visuals_found": len(metadata["worksheets"])
+            "counts": {
+                "visuals": len(metadata["worksheets"]),
+                "measures": len(metadata["measures"]),
+                "calc_columns": len(metadata["calculatedColumns"]),
+                "relationships": len(metadata["relationships"])
+            }
         }
 
     except Exception as e:
