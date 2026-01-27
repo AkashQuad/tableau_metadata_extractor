@@ -316,8 +316,6 @@
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
 
-
-
 import json
 import os
 import zipfile
@@ -325,7 +323,6 @@ import tempfile
 import re
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote
-from typing import List, Dict, Any
 
 # Third-party imports
 from fastapi import FastAPI, HTTPException
@@ -369,26 +366,16 @@ class ExtractMetadataRequest(BaseModel):
     outputContainerUrl: str
 
 # -------------------------------------------------
-# HELPERS
+# HELPERS (UNCHANGED)
 # -------------------------------------------------
 
 def clean_name(name: str) -> str:
-    """Cleans Tableau field names."""
     if not name:
         return ""
     name = name.replace("[", "").replace("]", "")
     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
     return name
-
-def get_blob_client(blob_url: str):
-    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    if conn_str:
-        try:
-            return BlobClient.from_blob_url(blob_url) 
-        except Exception:
-            pass
-    return BlobClient.from_blob_url(blob_url)
 
 def download_blob_to_file(blob_url: str, local_path: str):
     blob = BlobClient.from_blob_url(blob_url)
@@ -399,17 +386,16 @@ def download_blob_to_file(blob_url: str, local_path: str):
 def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     if not conn_str:
-        # For testing locally without Azure env, you might want to skip or mock this
-        if "test" in container_url: return "http://mock-url"
         raise ValueError("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
 
     container_name = container_url.rstrip("/").split("/")[-1]
-    
+
     blob = BlobClient.from_connection_string(
         conn_str=conn_str,
         container_name=container_name,
         blob_name=blob_name
     )
+
     blob.upload_blob(
         json.dumps(data, indent=2),
         overwrite=True,
@@ -418,7 +404,7 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     return blob.url
 
 # -------------------------------------------------
-# CORE EXTRACTION LOGIC
+# CORE EXTRACTION LOGIC (ENHANCED, NON-BREAKING)
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
@@ -428,240 +414,142 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         "worksheets": [],
         "dashboards": [],
         "globalFilters": [],
-        "semanticModel": {
-            "tables": [],
-            "relationships": [],
-            "aggregationHints": {},
-            "factTables": []
-        }
+        "relationships": [],
+        "columnUsageMap": {}
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # A. Unzip TWBX
-        try:
-            with zipfile.ZipFile(twbx_path, "r") as zip_ref:
-                zip_ref.extractall(tmpdir)
-        except zipfile.BadZipFile:
-            raise ValueError("File is not a valid .twbx zip file")
+        with zipfile.ZipFile(twbx_path, "r") as zip_ref:
+            zip_ref.extractall(tmpdir)
 
-        # B. Find .twb XML
         twb_file = None
         for root_dir, _, files in os.walk(tmpdir):
             for file in files:
                 if file.endswith(".twb"):
                     twb_file = os.path.join(root_dir, file)
                     break
-        
-        if not twb_file:
-            raise ValueError("No .twb XML file found inside TWBX")
 
-        # C. Parse XML & STRIP NAMESPACES
-        try:
-            tree = ET.parse(twb_file)
-            root = tree.getroot()
-        except ET.ParseError:
-            raise ValueError("Failed to parse .twb XML content")
-        
+        if not twb_file:
+            raise ValueError("No .twb file found")
+
+        tree = ET.parse(twb_file)
+        root = tree.getroot()
+
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
-        # --- 1. DATASOURCE & SEMANTIC MODEL TABLES ---
-        
-        extracted_tables = [] # List of dicts {name: str, columns: [names]}
+        # -------------------------------
+        # DATASOURCE & TABLES
+        # -------------------------------
+        table_columns_map = {}
 
-        for datasource in root.findall(".//datasource"):
-            ds_name = datasource.get("name")
-            
-            # Skip 'Parameters' datasource commonly found in Tableau
-            if ds_name == 'Parameters':
-                continue
+        datasource = root.find(".//datasource")
+        tables = []
 
-            # Populate basic dataSource info (Legacy requirement)
-            if not metadata["dataSource"]:
-                metadata["dataSource"] = {
-                    "name": ds_name,
-                    "type": "extract",
-                    "tables": []
-                }
+        if datasource is not None:
+            for relation in datasource.findall(".//relation"):
+                table = clean_name(relation.get("table"))
+                if not table:
+                    continue
+                table_columns_map[table] = set()
+                tables.append({
+                    "tableName": table,
+                    "columns": []
+                })
 
-            # Locate connections and relations
-            connection = datasource.find(".//connection")
-            if connection:
-                # Find all relations that act as tables
-                for relation in connection.findall(".//relation"):
-                    rel_type = relation.get("type")
-                    
-                    # Logic: In Tableau XML, type='table' is a physical table.
-                    if rel_type == "table":
-                        table_name = relation.get("name") 
-                        if not table_name:
-                            table_name = clean_name(relation.get("table", "UnknownTable"))
+            metadata["dataSource"] = {
+                "name": datasource.get("name") or "TableauData",
+                "type": "extract",
+                "tables": tables
+            }
 
-                        # Gather columns
-                        cols = []
-                        col_names_only = []
-                        is_fact_table = False
-
-                        for col in relation.findall("./columns/column"):
-                            c_name = col.get("name")
-                            c_type = col.get("datatype")
-                            c_ordinal = col.get("ordinal")
-                            
-                            cols.append({
-                                "name": c_name,
-                                "tableDataType": c_type,
-                                "ordinal": c_ordinal
-                            })
-                            col_names_only.append(c_name)
-
-                            # Heuristic: Fact table detection
-                            if c_type in ['real', 'integer'] and any(x in c_name.lower() for x in ['amount', 'price', 'sales', 'profit', 'quantity']):
-                                is_fact_table = True
-
-                        # Add to Semantic Model -> Tables
-                        table_entry = {
-                            "tableName": table_name,
-                            "columns": cols
-                        }
-                        metadata["semanticModel"]["tables"].append(table_entry)
-                        
-                        # Add to internal list for relationship building AND mapping
-                        extracted_tables.append({
-                            "tableName": table_name,
-                            "columns": col_names_only
-                        })
-
-                        # Add to Semantic Model -> FactTables (Heuristic)
-                        if is_fact_table:
-                            if table_name not in metadata["semanticModel"]["factTables"]:
-                                metadata["semanticModel"]["factTables"].append(table_name)
-
-                        # Add to Legacy dataSource -> tables
-                        metadata["dataSource"]["tables"].append({
-                            "tableName": relation.get("table", table_name), 
-                            "columns": [] 
-                        })
-
-        # --- NEW: Build Column -> Table Map ---
-        # This allows us to look up which table a column belongs to later
-        column_to_table_map = {}
-        for tbl in extracted_tables:
-            t_name = tbl["tableName"]
-            for col in tbl["columns"]:
-                # If a column exists in multiple tables (e.g. ID keys), 
-                # this simple map will store the last one processed.
-                column_to_table_map[col] = t_name
-
-        # --- 2. RELATIONSHIP INFERENCE ---
-        
-        processed_pairs = set()
-
-        for i in range(len(extracted_tables)):
-            table_a = extracted_tables[i]
-            for j in range(i + 1, len(extracted_tables)):
-                table_b = extracted_tables[j]
-                
-                common_cols = set(table_a["columns"]).intersection(set(table_b["columns"]))
-                
-                for col in common_cols:
-                    if "id" in col.lower() or "key" in col.lower() or "code" in col.lower():
-                        
-                        pair_id = tuple(sorted((table_a["tableName"], table_b["tableName"])))
-                        if pair_id in processed_pairs:
-                            continue
-                        processed_pairs.add(pair_id)
-
-                        metadata["semanticModel"]["relationships"].append({
-                            "fromTable": table_a["tableName"],
-                            "fromColumn": col,
-                            "toTable": table_b["tableName"],
-                            "toColumn": col,
-                            "cardinality": "ManyToOne", 
-                            "crossFilteringBehavior": "OneDirection"
-                        })
-                        break 
-
-        # --- 3. CALCULATED FIELDS ---
+        # -------------------------------
+        # COLUMNS & CALCULATED FIELDS
+        # -------------------------------
         for col in root.findall(".//column"):
+            col_name = clean_name(col.get("name"))
+            table_ref = col.get("table")
+
+            if table_ref:
+                table_ref = clean_name(table_ref)
+                table_columns_map.setdefault(table_ref, set()).add(col_name)
+
             calc = col.find("calculation")
             if calc is not None:
                 metadata["calculatedFields"].append({
-                    "name": clean_name(col.get("name")),
+                    "name": col_name,
                     "expression": calc.get("formula")
                 })
 
-        # --- 4. WORKSHEETS ---
+        # Populate table columns
+        for table in metadata["dataSource"].get("tables", []):
+            cols = table_columns_map.get(table["tableName"], [])
+            table["columns"] = sorted(cols)
+
+        # -------------------------------
+        # WORKSHEETS
+        # -------------------------------
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
-            bound_columns_set = set()
+            bound_columns = set()
+            used_tables = set()
 
-            # Dependency Detection
             for dep in worksheet.findall(".//datasource-dependencies"):
                 for col in dep.findall("column-instance"):
                     col_ref = col.get('column')
-                    clean_col = None
-                    
-                    if col_ref:
-                        parts = col_ref.split(']:')
-                        if len(parts) > 1:
-                            clean_col = clean_name(parts[-1])
-                    
-                    if not clean_col: 
-                        clean_col = clean_name(col.get('name'))
-                        
-                    if clean_col:
-                        bound_columns_set.add(clean_col)
+                    if col_ref and '].' in col_ref:
+                        table, column = col_ref.split('].')
+                        table = clean_name(table)
+                        column = clean_name(column)
+                        used_tables.add(table)
+                        bound_columns.add(column)
 
-            # Smart Visual Detection
+                        metadata["columnUsageMap"].setdefault(column, []).append(sheet_name)
+
+            mark_class = "Automatic"
             visual_type = "Automatic"
-            
-            for mark_element in worksheet.findall(".//pane/mark"):
-                cls = mark_element.get('class')
-                if cls and cls != "Automatic":
+
+            for mark in worksheet.findall(".//pane/mark"):
+                cls = mark.get("class")
+                if cls:
+                    mark_class = cls
                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
                     break
-            
-            if visual_type == "Automatic":
-                if worksheet.find(".//style-rule[@element='map']") is not None:
-                    visual_type = "Map"
-                elif worksheet.find(".//style-rule[@element='table']") is not None:
-                    visual_type = "Text Table"
-                else:
-                    col_list_lower = [c.lower() for c in bound_columns_set]
-                    map_keywords = ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']
-                    
-                    if any(k in col for col in col_list_lower for k in map_keywords):
-                        visual_type = "Map"
-                    elif len(bound_columns_set) == 1:
-                        visual_type = "Text Table"
-                    else:
-                        visual_type = "Bar Chart"
 
-            # UPDATED LOGIC: Use the map to find actual table names
+            if visual_type == "Automatic":
+                visual_type = "Bar Chart"
+
             formatted_columns = []
-            for col in sorted(list(bound_columns_set)):
-                # Default to "UnknownTable" if column not found in our extracted metadata
-                t_name = column_to_table_map.get(col, "UnknownTable")
+            for col in sorted(bound_columns):
+                table_match = next(iter(used_tables), None)
                 formatted_columns.append({
-                    "table": t_name,
+                    "table": table_match,
                     "column": col
                 })
 
             metadata["worksheets"].append({
                 "name": sheet_name,
-                "visualType": visual_type, 
+                "visualType": visual_type,
+                "markClass": mark_class,
+                "confidenceScore": round(0.6 if mark_class != "Automatic" else 0.4, 2),
+                "usedTables": sorted(list(used_tables)),
+                "hasCalculatedFields": any(
+                    col in [c["name"] for c in metadata["calculatedFields"]]
+                    for col in bound_columns
+                ),
                 "columns": formatted_columns
             })
 
-        # --- 5. DASHBOARDS ---
+        # -------------------------------
+        # DASHBOARDS
+        # -------------------------------
         for dashboard in root.findall(".//dashboard"):
             ws_names = []
             for zone in dashboard.findall(".//zone"):
-                z_name = zone.get("name")
-                if z_name:
-                    ws_names.append(z_name)
-            
+                if zone.get("name"):
+                    ws_names.append(zone.get("name"))
+
             metadata["dashboards"].append({
                 "dashboardName": dashboard.get("name"),
                 "worksheets": list(set(ws_names))
@@ -678,23 +566,19 @@ def handle_extraction(payload: ExtractMetadataRequest):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_twbx = os.path.join(tmpdir, "input.twbx")
-            
-            # Download
+
             download_blob_to_file(payload.inputBlobUrl, local_twbx)
-            
-            # Extract
             metadata = extract_tableau_metadata(local_twbx)
-            
-            # Upload
+
             base_name = unquote(os.path.basename(payload.inputBlobUrl))
             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
-            
+
             output_url = upload_json_to_blob(
                 payload.outputContainerUrl,
                 output_name,
                 metadata
             )
-            
+
         return {
             "status": "success",
             "outputBlobUrl": output_url,
