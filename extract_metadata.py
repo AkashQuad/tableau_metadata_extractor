@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from azure.storage.blob import BlobClient
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Tableau Metadata Extractor (Multi-DS)")
+app = FastAPI(title="Tableau to Power BI Migrator - Metadata Extractor")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,8 @@ app.add_middleware(
 MARK_MAP = {
     'bar': 'Bar Chart', 'line': 'Line Chart', 'area': 'Area Chart',
     'text': 'Text Table', 'circle': 'Scatter Plot', 'square': 'Heat Map',
-    'pie': 'Pie Chart', 'map': 'Map', 'filledmap': 'Map'
+    'pie': 'Pie Chart', 'map': 'Map', 'filledmap': 'Map', 'shape': 'Shape',
+    'ganttbar': 'Gantt'
 }
 
 class ExtractMetadataRequest(BaseModel):
@@ -53,11 +54,17 @@ def parse_join_expression(node):
     if node is None: return ""
     op = node.get("op")
     children = list(node)
+    
     if not children: return op
+    
+    # Clean up ops for readability
+    if op == "=": op = "=="
+    
     if len(children) == 2:
         left = parse_join_expression(children[0])
         right = parse_join_expression(children[1])
-        return f"{left} {op} {right}"
+        return f"({left} {op} {right})"
+    
     return op
 
 def download_blob_to_file(blob_url: str, local_path: str):
@@ -81,7 +88,8 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict):
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
     final_output = {
-        "dataSources": [],  # Changed to list to handle multiple DS
+        "parameters": [],
+        "dataSources": [],
         "worksheets": []
     }
 
@@ -104,14 +112,22 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             if '}' in elem.tag: elem.tag = elem.tag.split('}', 1)[1]
 
         # ==========================================
-        # LOOP THROUGH ALL DATA SOURCES
+        # A. PARAMETERS (Global Variables)
         # ==========================================
-        # In your XML, you have multiple <datasource> tags. We must process each.
+        for ds_node in root.findall(".//datasource[@name='Parameters']"):
+            for col in ds_node.findall("column"):
+                final_output["parameters"].append({
+                    "name": clean_name(col.get("caption") or col.get("name")),
+                    "dataType": col.get("datatype"),
+                    "value": col.get("value")
+                })
+
+        # ==========================================
+        # B. DATA SOURCES (Tables, Joins, Fields)
+        # ==========================================
         for ds_node in root.findall(".//datasource"):
             ds_name = ds_node.get("caption") or ds_node.get("name")
-            
-            # Skip "Parameters" datasource if it exists (Tableau specific)
-            if ds_name == "Parameters": continue
+            if ds_name == "Parameters": continue # Handled above
 
             ds_meta = {
                 "name": ds_name,
@@ -121,55 +137,75 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     "measures": [],
                     "calculatedColumns": [],
                     "dimensions": []
-                }
+                },
+                "hierarchies": []
             }
 
-            # --- A. TABLES ---
-            table_map = {} # Map ID -> Clean Name
+            # --- 1. TABLES (Deduplicated) ---
+            # Tableau puts <relation> tags in <connection> AND <object-graph>. We want unique tables.
+            seen_tables = set()
             
-            # Find physical tables (connection references)
-            for rel in ds_node.findall(".//relation"):
-                t_name = rel.get("table") or rel.get("name")
-                t_type = rel.get("type")
-                
-                # Check if it's a valid table (and not a nested join clause)
+            # Helper to add table
+            def add_table(rel_node):
+                t_name = rel_node.get("table") or rel_node.get("name")
+                t_type = rel_node.get("type")
                 if t_name and t_type == "table":
                     clean_tbl = clean_name(t_name)
-                    # Deduplication check
-                    if not any(t['name'] == clean_tbl for t in ds_meta["tables"]):
+                    if clean_tbl not in seen_tables:
+                        seen_tables.add(clean_tbl)
                         ds_meta["tables"].append({
                             "name": clean_tbl,
                             "rawName": t_name,
-                            "connection": rel.get("connection")
+                            "connection": rel_node.get("connection")
                         })
 
-            # --- B. RELATIONSHIPS (Noodles) ---
-            obj_graph = ds_node.find(".//object-graph")
-            if obj_graph:
-                # 1. Build ID Map
-                for obj in obj_graph.findall(".//object"):
-                    obj_id = obj.get("id")
-                    caption = obj.get("caption")
-                    table_map[obj_id] = clean_name(caption)
-                
-                # 2. Extract Relationships
-                for rel in obj_graph.findall(".//relationship"):
-                    left_id = rel.find("first-end-point").get("object-id")
-                    right_id = rel.find("second-end-point").get("object-id")
-                    
-                    join_expr = parse_join_expression(rel.find("expression"))
+            # Check Connection (Physical Layer)
+            for conn in ds_node.findall(".//connection"):
+                for rel in conn.findall(".//relation"):
+                    add_table(rel)
+            
+            # Check Object Graph (Logical Layer) - Fallback if physical missing
+            if not ds_meta["tables"]:
+                for rel in ds_node.findall(".//relation"):
+                    add_table(rel)
 
+            # --- 2. RELATIONSHIPS ---
+            # Strategy: Check Object Graph (Noodles) FIRST. If empty, check Relations (Joins).
+            obj_graph = ds_node.find(".//object-graph")
+            
+            if obj_graph:
+                # Modern "Noodle" Relationships
+                id_map = {}
+                for obj in obj_graph.findall(".//object"):
+                    id_map[obj.get("id")] = clean_name(obj.get("caption"))
+
+                for rel in obj_graph.findall(".//relationship"):
+                    left = id_map.get(rel.find("first-end-point").get("object-id"))
+                    right = id_map.get(rel.find("second-end-point").get("object-id"))
+                    condition = parse_join_expression(rel.find("expression"))
+                    
                     ds_meta["relationships"].append({
-                        "fromTable": table_map.get(left_id, left_id),
-                        "toTable": table_map.get(right_id, right_id),
-                        "joinCondition": join_expr
+                        "type": "Logical",
+                        "fromTable": left,
+                        "toTable": right,
+                        "joinCondition": condition
+                    })
+            else:
+                # Legacy "Physical" Joins
+                for join in ds_node.findall(".//relation[@type='join']"):
+                    # This is harder to parse as it relies on nested structures. 
+                    # Simplified extraction:
+                    clause = join.find("clause")
+                    expr = clause.get("expression") if clause is not None else "Unknown"
+                    ds_meta["relationships"].append({
+                        "type": "Join (" + join.get("join", "") + ")",
+                        "joinCondition": expr
                     })
 
-            # --- C. FIELDS (DAX Prep) ---
+            # --- 3. FIELDS (Dimensions, Measures, DAX) ---
             for col in ds_node.findall("column"):
                 name = col.get("name")
-                # Skip internal Tableau calculation artifacts
-                if "tableau_internal_object_id" in name: continue
+                if not name or "tableau_internal_object_id" in name: continue
 
                 caption = col.get("caption") or clean_name(name)
                 role = col.get("role")
@@ -185,11 +221,12 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     "formula": formula
                 }
 
-                # CLASSIFICATION LOGIC
                 if formula:
                     if role == "measure":
+                        field_def["category"] = "Measure"
                         ds_meta["fields"]["measures"].append(field_def)
                     else:
+                        field_def["category"] = "Calculated Column"
                         ds_meta["fields"]["calculatedColumns"].append(field_def)
                 elif role == "measure":
                     field_def["isImplicit"] = True
@@ -197,20 +234,34 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 else:
                     ds_meta["fields"]["dimensions"].append(field_def)
 
+            # --- 4. HIERARCHIES (Drill Paths) ---
+            for drill in ds_node.findall("drill-paths/drill-path"):
+                h_name = drill.get("name")
+                levels = []
+                for field in drill.findall("field"):
+                    levels.append(clean_name(field.get("name")))
+                
+                ds_meta["hierarchies"].append({
+                    "name": h_name,
+                    "levels": levels
+                })
+
             final_output["dataSources"].append(ds_meta)
 
         # ==========================================
-        # WORKSHEETS
+        # C. WORKSHEETS (Visuals)
         # ==========================================
         for ws in root.findall(".//worksheet"):
             sheet_name = ws.get('name')
             
+            # Columns Used
             columns = set()
             for dep in ws.findall(".//datasource-dependencies"):
                 for col_inst in dep.findall("column-instance"):
                     c_name = col_inst.get("column") or col_inst.get("name")
                     if c_name: columns.add(clean_name(c_name))
 
+            # Visual Type Detection
             v_type = "Automatic"
             for mark in ws.findall(".//pane/mark"):
                 cls = mark.get("class")
@@ -219,8 +270,8 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             
             final_output["worksheets"].append({
                 "name": sheet_name,
-                "type": v_type,
-                "columns": list(columns)
+                "visualType": v_type,
+                "usedColumns": list(columns)
             })
 
     return final_output
@@ -238,20 +289,19 @@ def api_handler(payload: ExtractMetadataRequest):
             
             data = extract_tableau_metadata(local_path)
             
-            output_name = os.path.splitext(os.path.basename(payload.inputBlobUrl))[0] + "_v3_multi_metadata.json"
-            url = upload_json_to_blob(payload.outputContainerUrl, output_name, data)
+            # Smart naming for output file
+            base_name = unquote(os.path.basename(payload.inputBlobUrl))
+            output_name = os.path.splitext(base_name)[0] + "_full_metadata.json"
             
-            # Stats for response
-            ds_count = len(data["dataSources"])
-            total_tables = sum(len(d["tables"]) for d in data["dataSources"])
+            url = upload_json_to_blob(payload.outputContainerUrl, output_name, data)
             
             return {
                 "status": "success", 
-                "outputUrl": url,
-                "stats": {
-                    "dataSources": ds_count,
-                    "totalTables": total_tables,
-                    "worksheets": len(data["worksheets"])
+                "outputBlobUrl": url,
+                "summary": {
+                    "dataSources": len(data["dataSources"]),
+                    "worksheets": len(data["worksheets"]),
+                    "parameters": len(data["parameters"])
                 }
             }
     except Exception as e:
