@@ -317,7 +317,6 @@
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
-
 import json
 import os
 import zipfile
@@ -332,9 +331,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from azure.storage.blob import BlobClient
 
-# -------------------------------------------------
 # Initialize App
-# -------------------------------------------------
 app = FastAPI(title="Tableau Metadata Extractor API")
 
 app.add_middleware(
@@ -370,7 +367,7 @@ class ExtractMetadataRequest(BaseModel):
     outputContainerUrl: str
 
 # -------------------------------------------------
-# HELPERS (EXISTING – UNCHANGED)
+# HELPERS
 # -------------------------------------------------
 
 def clean_name(name: str) -> str:
@@ -383,7 +380,7 @@ def clean_name(name: str) -> str:
     # 1. Remove brackets
     name = name.replace("[", "").replace("]", "")
 
-    # 2. Remove Tableau internal patterns (start prefixes)
+    # 2. Remove Tableau internal prefixes
     name = re.sub(
         r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):',
         '',
@@ -391,17 +388,15 @@ def clean_name(name: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # 3. Remove internal suffixes
+    # 3. Remove Tableau internal suffixes
     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
 
     return name
 
 def download_blob_to_file(blob_url: str, local_path: str):
-    # NOTE: If your blob is private, blob_url MUST include a SAS token
     blob = BlobClient.from_blob_url(blob_url)
     with open(local_path, "wb") as f:
-        data = blob.download_blob()
-        data.readinto(f)
+        blob.download_blob().readinto(f)
 
 def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
@@ -425,121 +420,17 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     return blob.url
 
 # -------------------------------------------------
-# NEW SEMANTIC HELPERS (PHASE 2 – ADDITIVE ONLY)
-# -------------------------------------------------
-
-def extract_tables_and_columns(root):
-    """
-    Extracts physical tables and columns for semantic model generation.
-    De-duplicates columns safely.
-    """
-    tables = {}
-
-    for datasource in root.findall(".//datasource"):
-        for relation in datasource.findall(".//relation"):
-            table_raw = relation.get("name") or relation.get("table")
-            table_name = clean_name(table_raw)
-
-            if table_name not in tables:
-                tables[table_name] = {
-                    "tableName": table_name,
-                    "columns": {}
-                }
-
-            for col in relation.findall(".//column"):
-                col_name = clean_name(col.get("name"))
-                if col_name not in tables[table_name]["columns"]:
-                    tables[table_name]["columns"][col_name] = {
-                        "name": col_name,
-                        "tableDataType": col.get("datatype"),
-                        "ordinal": col.get("ordinal")
-                    }
-
-    # Convert column maps to lists
-    for t in tables.values():
-        t["columns"] = list(t["columns"].values())
-
-    return list(tables.values())
-
-def extract_aggregation_hints(root):
-    """
-    Extracts Tableau aggregation intent (Sum, Count, Year, etc.)
-    """
-    aggregations = {}
-
-    for col in root.findall(".//column"):
-        name = clean_name(col.get("name"))
-        agg = col.get("aggregation")
-        if agg:
-            aggregations[name] = agg
-
-    return aggregations
-
-def infer_relationships(tables):
-    """
-    Infers relationships using shared column names.
-    Prevents self-joins and duplicates.
-    """
-    column_index = {}
-
-    for table in tables:
-        for col in table["columns"]:
-            column_index.setdefault(col["name"], []).append(table["tableName"])
-
-    relationships = []
-
-    for column, table_list in column_index.items():
-        unique_tables = list(set(table_list))
-
-        # Must be exactly two different tables
-        if len(unique_tables) != 2:
-            continue
-
-        t1, t2 = unique_tables
-
-        relationships.append({
-            "fromTable": t2,
-            "fromColumn": column,
-            "toTable": t1,
-            "toColumn": column,
-            "cardinality": "ManyToOne",
-            "crossFilteringBehavior": "OneDirection"
-        })
-
-    return relationships
-
-def detect_fact_tables(tables):
-    """
-    Heuristic detection of fact tables.
-    """
-    facts = []
-
-    for table in tables:
-        numeric_cols = [
-            c for c in table["columns"]
-            if c["tableDataType"] in ("real", "integer", "float", "double")
-        ]
-        if numeric_cols:
-            facts.append(table["tableName"])
-
-    return facts
-
-# -------------------------------------------------
 # CORE EXTRACTION LOGIC
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
-    """
-    Extracts Tableau metadata for visuals AND semantic model generation.
-    Phase-1 output preserved exactly.
-    """
-
     metadata = {
         "dataSource": {},
         "calculatedFields": [],
         "worksheets": [],
         "dashboards": [],
-        "globalFilters": []
+        "globalFilters": [],
+        "semanticModel": {}
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -547,7 +438,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         with zipfile.ZipFile(twbx_path, "r") as zip_ref:
             zip_ref.extractall(tmpdir)
 
-        # B. Find .twb XML
+        # B. Locate TWB
         twb_file = None
         for root_dir, _, files in os.walk(tmpdir):
             for file in files:
@@ -556,38 +447,51 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     break
 
         if not twb_file:
-            raise ValueError("No .twb XML file found inside TWBX")
+            raise ValueError("No .twb XML found")
 
-        # C. Parse XML & STRIP NAMESPACES
+        # C. Parse XML
         tree = ET.parse(twb_file)
         root = tree.getroot()
 
+        # Strip namespaces
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # -------------------------------------------------
-        # 1. DATASOURCE (EXISTING)
+        # DATASOURCE → TABLE MAP (NEW, REQUIRED)
+        # -------------------------------------------------
+        datasource_table_map = {}
+
+        for ds in root.findall(".//datasource"):
+            ds_id = ds.get("name")
+            for rel in ds.findall(".//relation"):
+                table_name = clean_name(rel.get("name") or rel.get("table"))
+                datasource_table_map[ds_id] = table_name
+
+        # -------------------------------------------------
+        # DATASOURCE (UNCHANGED)
         # -------------------------------------------------
         datasource = root.find(".//datasource")
         if datasource is not None:
             tables = []
             for relation in datasource.findall(".//relation"):
                 table_name = relation.get("table")
-                if table_name:
-                    tables.append({
-                        "tableName": clean_name(table_name),
-                        "columns": []
-                    })
+                if not table_name:
+                    continue
+                tables.append({
+                    "tableName": clean_name(table_name),
+                    "columns": []
+                })
 
             metadata["dataSource"] = {
-                "name": datasource.get("name") or "TableauData",
+                "name": datasource.get("name"),
                 "type": "extract",
                 "tables": tables
             }
 
         # -------------------------------------------------
-        # 2. CALCULATED FIELDS (EXISTING)
+        # CALCULATED FIELDS (UNCHANGED)
         # -------------------------------------------------
         for col in root.findall(".//column"):
             calc = col.find("calculation")
@@ -598,61 +502,55 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 })
 
         # -------------------------------------------------
-        # 3. WORKSHEETS (EXISTING – FULL SMART VISUAL LOGIC RESTORED)
+        # WORKSHEETS (MainTable REMOVED HERE ONLY)
         # -------------------------------------------------
         for worksheet in root.findall(".//worksheet"):
-            sheet_name = worksheet.get('name')
-            bound_columns_set = set()
+            sheet_name = worksheet.get("name")
 
-            # Dependency Detection
+            bound_columns = {}  # column_name → table_name
+
             for dep in worksheet.findall(".//datasource-dependencies"):
+                ds_id = dep.get("datasource")
+
                 for col in dep.findall("column-instance"):
-                    col_ref = col.get('column')
-                    clean_col = None
+                    col_ref = col.get("column")
+                    if not col_ref:
+                        continue
 
-                    if col_ref:
-                        parts = col_ref.split(']:')
-                        if len(parts) > 1:
-                            clean_col = clean_name(parts[-1])
+                    raw_col = col_ref.split("]:")[-1]
+                    column_name = clean_name(raw_col)
 
-                    if not clean_col:
-                        clean_col = clean_name(col.get('name'))
+                    table_name = datasource_table_map.get(ds_id, "UnknownTable")
 
-                    if clean_col:
-                        bound_columns_set.add(clean_col)
+                    bound_columns[column_name] = table_name
 
-            # Smart Visual Detection (RESTORED)
+            # ---------------- VISUAL DETECTION (RESTORED)
             visual_type = "Automatic"
 
-            # A. Marks
-            for mark_element in worksheet.findall(".//pane/mark"):
-                cls = mark_element.get('class')
+            for mark in worksheet.findall(".//pane/mark"):
+                cls = mark.get("class")
                 if cls and cls != "Automatic":
                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
                     break
 
-            # B. Style rules
             if visual_type == "Automatic":
                 if worksheet.find(".//style-rule[@element='map']") is not None:
                     visual_type = "Map"
                 elif worksheet.find(".//style-rule[@element='table']") is not None:
                     visual_type = "Text Table"
 
-            # C. Column heuristics
             if visual_type == "Automatic":
-                col_list_lower = [c.lower() for c in bound_columns_set]
-                map_keywords = ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']
-
-                if any(k in col for col in col_list_lower for k in map_keywords):
+                cols_lower = [c.lower() for c in bound_columns]
+                if any(k in col for col in cols_lower for k in ["city", "state", "country", "lat", "lon"]):
                     visual_type = "Map"
-                elif len(bound_columns_set) == 1:
+                elif len(bound_columns) == 1:
                     visual_type = "Text Table"
                 else:
                     visual_type = "Bar Chart"
 
             formatted_columns = [
-                {"table": "MainTable", "column": col}
-                for col in sorted(bound_columns_set)
+                {"table": table, "column": col}
+                for col, table in bound_columns.items()
             ]
 
             metadata["worksheets"].append({
@@ -662,7 +560,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             })
 
         # -------------------------------------------------
-        # 4. DASHBOARDS (EXISTING)
+        # DASHBOARDS (UNCHANGED)
         # -------------------------------------------------
         for dashboard in root.findall(".//dashboard"):
             ws_names = []
@@ -676,18 +574,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 "worksheets": list(set(ws_names))
             })
 
-        # -------------------------------------------------
-        # 5. SEMANTIC MODEL (NEW – ADDITIVE)
-        # -------------------------------------------------
-        semantic_tables = extract_tables_and_columns(root)
-
-        metadata["semanticModel"] = {
-            "tables": semantic_tables,
-            "relationships": infer_relationships(semantic_tables),
-            "aggregationHints": extract_aggregation_hints(root),
-            "factTables": detect_fact_tables(semantic_tables)
-        }
-
     return metadata
 
 # -------------------------------------------------
@@ -700,13 +586,10 @@ def handle_extraction(payload: ExtractMetadataRequest):
         with tempfile.TemporaryDirectory() as tmpdir:
             local_twbx = os.path.join(tmpdir, "input.twbx")
 
-            # Download
             download_blob_to_file(payload.inputBlobUrl, local_twbx)
 
-            # Extract
             metadata = extract_tableau_metadata(local_twbx)
 
-            # Upload
             base_name = unquote(os.path.basename(payload.inputBlobUrl))
             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
 
@@ -719,16 +602,12 @@ def handle_extraction(payload: ExtractMetadataRequest):
         return {
             "status": "success",
             "outputBlobUrl": output_url,
-            "visuals_found": len(metadata["worksheets"]),
-            "tables_found": len(metadata.get("semanticModel", {}).get("tables", []))
+            "visuals_found": len(metadata["worksheets"])
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------------------------------------
-# LOCAL DEV
-# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
