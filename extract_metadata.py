@@ -318,7 +318,6 @@
 
 
 
-
 import json
 import os
 import zipfile
@@ -469,7 +468,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
 
         # --- 1. DATASOURCE & SEMANTIC MODEL TABLES ---
         
-        # We define a temporary list to hold table schemas for relationship inference later
         extracted_tables = [] # List of dicts {name: str, columns: [names]}
 
         for datasource in root.findall(".//datasource"):
@@ -496,8 +494,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     
                     # Logic: In Tableau XML, type='table' is a physical table.
                     if rel_type == "table":
-                        # use 'name' attribute for clean filename (e.g. customers.csv)
-                        # use 'table' attribute for internal ID (e.g. [customers#csv])
                         table_name = relation.get("name") 
                         if not table_name:
                             table_name = clean_name(relation.get("table", "UnknownTable"))
@@ -519,7 +515,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                             })
                             col_names_only.append(c_name)
 
-                            # Heuristic: If it contains 'amount', 'price', 'quantity' or is real/integer, likely a fact
+                            # Heuristic: Fact table detection
                             if c_type in ['real', 'integer'] and any(x in c_name.lower() for x in ['amount', 'price', 'sales', 'profit', 'quantity']):
                                 is_fact_table = True
 
@@ -530,7 +526,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                         }
                         metadata["semanticModel"]["tables"].append(table_entry)
                         
-                        # Add to internal list for relationship building
+                        # Add to internal list for relationship building AND mapping
                         extracted_tables.append({
                             "tableName": table_name,
                             "columns": col_names_only
@@ -541,15 +537,23 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                             if table_name not in metadata["semanticModel"]["factTables"]:
                                 metadata["semanticModel"]["factTables"].append(table_name)
 
-                        # Add to Legacy dataSource -> tables (simple format)
+                        # Add to Legacy dataSource -> tables
                         metadata["dataSource"]["tables"].append({
-                            "tableName": relation.get("table", table_name), # preserving original logic requested
+                            "tableName": relation.get("table", table_name), 
                             "columns": [] 
                         })
 
+        # --- NEW: Build Column -> Table Map ---
+        # This allows us to look up which table a column belongs to later
+        column_to_table_map = {}
+        for tbl in extracted_tables:
+            t_name = tbl["tableName"]
+            for col in tbl["columns"]:
+                # If a column exists in multiple tables (e.g. ID keys), 
+                # this simple map will store the last one processed.
+                column_to_table_map[col] = t_name
+
         # --- 2. RELATIONSHIP INFERENCE ---
-        # Since the provided XML has separate datasources (Federated), explicit joins might not be present 
-        # in a single <relation type='join'> tag. We infer based on common ID columns.
         
         processed_pairs = set()
 
@@ -558,14 +562,11 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             for j in range(i + 1, len(extracted_tables)):
                 table_b = extracted_tables[j]
                 
-                # Check for common column names ending in 'id' or 'key' or just exact matches
                 common_cols = set(table_a["columns"]).intersection(set(table_b["columns"]))
                 
                 for col in common_cols:
-                    # Filter for likely join keys (IDs)
                     if "id" in col.lower() or "key" in col.lower() or "code" in col.lower():
                         
-                        # Prevent duplicate relationships
                         pair_id = tuple(sorted((table_a["tableName"], table_b["tableName"])))
                         if pair_id in processed_pairs:
                             continue
@@ -576,10 +577,9 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                             "fromColumn": col,
                             "toTable": table_b["tableName"],
                             "toColumn": col,
-                            "cardinality": "ManyToOne", # Default assumption for star schema
+                            "cardinality": "ManyToOne", 
                             "crossFilteringBehavior": "OneDirection"
                         })
-                        # Usually only need one join key per table pair
                         break 
 
         # --- 3. CALCULATED FIELDS ---
@@ -603,7 +603,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     clean_col = None
                     
                     if col_ref:
-                        # [some_table].[column_name] -> column_name
                         parts = col_ref.split(']:')
                         if len(parts) > 1:
                             clean_col = clean_name(parts[-1])
@@ -617,14 +616,12 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
             # Smart Visual Detection
             visual_type = "Automatic"
             
-            # A. Check Marks
             for mark_element in worksheet.findall(".//pane/mark"):
                 cls = mark_element.get('class')
                 if cls and cls != "Automatic":
                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
                     break
             
-            # B. Check Style Rules / Heuristics
             if visual_type == "Automatic":
                 if worksheet.find(".//style-rule[@element='map']") is not None:
                     visual_type = "Map"
@@ -641,10 +638,15 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     else:
                         visual_type = "Bar Chart"
 
-            formatted_columns = [
-                {"table": "MainTable", "column": col} 
-                for col in sorted(list(bound_columns_set))
-            ]
+            # UPDATED LOGIC: Use the map to find actual table names
+            formatted_columns = []
+            for col in sorted(list(bound_columns_set)):
+                # Default to "UnknownTable" if column not found in our extracted metadata
+                t_name = column_to_table_map.get(col, "UnknownTable")
+                formatted_columns.append({
+                    "table": t_name,
+                    "column": col
+                })
 
             metadata["worksheets"].append({
                 "name": sheet_name,
@@ -700,7 +702,6 @@ def handle_extraction(payload: ExtractMetadataRequest):
         }
 
     except Exception as e:
-        # In production, use logger.error(str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
