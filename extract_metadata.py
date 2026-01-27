@@ -316,6 +316,13 @@
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
+
+
+
+
+
+
 import json
 import os
 import zipfile
@@ -366,19 +373,44 @@ class ExtractMetadataRequest(BaseModel):
     outputContainerUrl: str
 
 # -------------------------------------------------
-# HELPERS (UNCHANGED)
+# HELPERS
 # -------------------------------------------------
 
 def clean_name(name: str) -> str:
+    """
+    Cleans Tableau field names.
+    """
     if not name:
         return ""
+    
+    # 1. Remove brackets
     name = name.replace("[", "").replace("]", "")
+    
+    # 2. Remove Tableau internal patterns (start prefixes)
     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
+    
+    # 3. Remove internal suffixes
     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
+    
     return name
+
+def get_blob_client(blob_url: str):
+    """
+    Helper to get a BlobClient. 
+    """
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    
+    if conn_str:
+        try:
+            return BlobClient.from_blob_url(blob_url) 
+        except Exception:
+            pass
+            
+    return BlobClient.from_blob_url(blob_url)
 
 def download_blob_to_file(blob_url: str, local_path: str):
     blob = BlobClient.from_blob_url(blob_url)
+    
     with open(local_path, "wb") as f:
         data = blob.download_blob()
         data.readinto(f)
@@ -389,13 +421,12 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
         raise ValueError("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
 
     container_name = container_url.rstrip("/").split("/")[-1]
-
+    
     blob = BlobClient.from_connection_string(
         conn_str=conn_str,
         container_name=container_name,
         blob_name=blob_name
     )
-
     blob.upload_blob(
         json.dumps(data, indent=2),
         overwrite=True,
@@ -404,7 +435,7 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     return blob.url
 
 # -------------------------------------------------
-# CORE EXTRACTION LOGIC (ENHANCED, NON-BREAKING)
+# CORE EXTRACTION LOGIC
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
@@ -413,143 +444,213 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         "calculatedFields": [],
         "worksheets": [],
         "dashboards": [],
-        "globalFilters": [],
-        "relationships": [],
-        "columnUsageMap": {}
+        "globalFilters": []
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(twbx_path, "r") as zip_ref:
-            zip_ref.extractall(tmpdir)
+        # A. Unzip TWBX
+        try:
+            with zipfile.ZipFile(twbx_path, "r") as zip_ref:
+                zip_ref.extractall(tmpdir)
+        except zipfile.BadZipFile:
+            raise ValueError("File is not a valid .twbx zip file")
 
+        # B. Find .twb XML
         twb_file = None
         for root_dir, _, files in os.walk(tmpdir):
             for file in files:
                 if file.endswith(".twb"):
                     twb_file = os.path.join(root_dir, file)
                     break
-
+        
         if not twb_file:
-            raise ValueError("No .twb file found")
+            raise ValueError("No .twb XML file found inside TWBX")
 
-        tree = ET.parse(twb_file)
-        root = tree.getroot()
-
+        # C. Parse XML & STRIP NAMESPACES
+        try:
+            tree = ET.parse(twb_file)
+            root = tree.getroot()
+        except ET.ParseError:
+            raise ValueError("Failed to parse .twb XML content")
+        
+        # Namespace stripping
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
-        # -------------------------------
-        # DATASOURCE & TABLES
-        # -------------------------------
-        table_columns_map = {}
-
+        # ---------------------------------------------
+        # 1. DATASOURCE (Enhanced for Phase 2)
+        # ---------------------------------------------
         datasource = root.find(".//datasource")
-        tables = []
+        ds_info = {
+            "name": "TableauData",
+            "type": "extract",
+            "tables": [],
+            "connectionInfo": {},
+            "rawColumns": {} # Helper map for O(1) lookups later
+        }
 
         if datasource is not None:
+            ds_info["name"] = datasource.get("name") or "TableauData"
+            
+            # Extract Connection Details (Server, DB, Type)
+            connection = datasource.find(".//connection")
+            if connection is not None:
+                ds_info["connectionInfo"] = {
+                    "class": connection.get("class"),
+                    "dbname": connection.get("dbname"),
+                    "server": connection.get("server"),
+                    "username": connection.get("username")
+                }
+
+            # Extract Tables/Relations
+            # Handling Tableau's logical layer (relation tags)
             for relation in datasource.findall(".//relation"):
-                table = clean_name(relation.get("table"))
-                if not table:
-                    continue
-                table_columns_map[table] = set()
-                tables.append({
-                    "tableName": table,
-                    "columns": []
-                })
+                table_name = relation.get("table")
+                # Fallback: if 'table' attribute is missing, check if it's a join/union
+                if not table_name:
+                    table_name = relation.get("name") # Use logical name if table name missing
+
+                if table_name: 
+                    clean_tbl = clean_name(table_name)
+                    ds_info["tables"].append({
+                        "tableName": clean_tbl,
+                        "rawName": table_name,
+                        "type": relation.get("type", "table")
+                    })
+
+            # Extract Column Definitions (Data Types & Roles)
+            # This creates a "Data Dictionary" for the semantic model
+            for col in datasource.findall(".//column"):
+                col_name = col.get("name")
+                if col_name:
+                    clean_col = clean_name(col_name)
+                    ds_info["rawColumns"][clean_col] = {
+                        "datatype": col.get("datatype"),
+                        "role": col.get("role"),
+                        "type": col.get("type"), # quantitative vs nominal
+                        "caption": col.get("caption", clean_col)
+                    }
 
             metadata["dataSource"] = {
-                "name": datasource.get("name") or "TableauData",
-                "type": "extract",
-                "tables": tables
+                "name": ds_info["name"],
+                "type": ds_info["connectionInfo"].get("class", "extract"),
+                "tables": ds_info["tables"],
+                "connection": ds_info["connectionInfo"]
             }
 
-        # -------------------------------
-        # COLUMNS & CALCULATED FIELDS
-        # -------------------------------
+        # ---------------------------------------------
+        # 2. CALCULATED FIELDS
+        # ---------------------------------------------
         for col in root.findall(".//column"):
-            col_name = clean_name(col.get("name"))
-            table_ref = col.get("table")
-
-            if table_ref:
-                table_ref = clean_name(table_ref)
-                table_columns_map.setdefault(table_ref, set()).add(col_name)
-
             calc = col.find("calculation")
             if calc is not None:
+                c_name = clean_name(col.get("name"))
+                # Phase 2: Capture datatype for easier DAX conversion
+                c_type = col.get("datatype", "unknown")
                 metadata["calculatedFields"].append({
-                    "name": col_name,
-                    "expression": calc.get("formula")
+                    "name": c_name,
+                    "expression": calc.get("formula"),
+                    "dataType": c_type
                 })
 
-        # Populate table columns
-        for table in metadata["dataSource"].get("tables", []):
-            cols = table_columns_map.get(table["tableName"], [])
-            table["columns"] = sorted(cols)
-
-        # -------------------------------
-        # WORKSHEETS
-        # -------------------------------
+        # ---------------------------------------------
+        # 3. WORKSHEETS (Fixed Table Name Logic)
+        # ---------------------------------------------
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
-            bound_columns = set()
-            used_tables = set()
+            bound_columns_data = [] # List of objects instead of set for richer data
 
+            # Dependency Detection
             for dep in worksheet.findall(".//datasource-dependencies"):
                 for col in dep.findall("column-instance"):
                     col_ref = col.get('column')
-                    if col_ref and '].' in col_ref:
-                        table, column = col_ref.split('].')
-                        table = clean_name(table)
-                        column = clean_name(column)
-                        used_tables.add(table)
-                        bound_columns.add(column)
+                    # col_ref usually looks like [TableName].[ColumnName] or [ColumnName]
+                    
+                    raw_col_name = col.get('name')
+                    clean_col = None
+                    detected_table = None
 
-                        metadata["columnUsageMap"].setdefault(column, []).append(sheet_name)
+                    # Strategy A: Try to parse [Table].[Column]
+                    if col_ref and '].[' in col_ref:
+                        # Extract text between first []
+                        match = re.search(r'^\[(.*?)\]\.\[(.*?)\]', col_ref)
+                        if match:
+                            detected_table = clean_name(match.group(1))
+                            clean_col = clean_name(match.group(2))
+                    
+                    # Strategy B: Fallback parsing
+                    if not clean_col:
+                        clean_col = clean_name(raw_col_name)
 
-            mark_class = "Automatic"
+                    if clean_col:
+                        # Lookup data type from the DS dictionary we built earlier
+                        col_meta = ds_info["rawColumns"].get(clean_col, {})
+                        
+                        # Determine Table Name:
+                        # 1. Use detected table from string parsing
+                        # 2. Use first table in datasource (Single table assumption fallback)
+                        # 3. Default to "Extract"
+                        final_table_name = "Extract"
+                        if detected_table:
+                            final_table_name = detected_table
+                        elif ds_info["tables"]:
+                            final_table_name = ds_info["tables"][0]["tableName"]
+                        
+                        # Avoid duplicates in this specific sheet
+                        if not any(x['column'] == clean_col for x in bound_columns_data):
+                            bound_columns_data.append({
+                                "table": final_table_name,
+                                "column": clean_col,
+                                "dataType": col_meta.get("datatype", "string"),
+                                "role": col_meta.get("role", "dimension")
+                            })
+
+            # Smart Visual Detection
             visual_type = "Automatic"
-
-            for mark in worksheet.findall(".//pane/mark"):
-                cls = mark.get("class")
-                if cls:
-                    mark_class = cls
+            
+            # A. Check Marks
+            for mark_element in worksheet.findall(".//pane/mark"):
+                cls = mark_element.get('class')
+                if cls and cls != "Automatic":
                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
                     break
-
+            
+            # B. Check Style Rules
             if visual_type == "Automatic":
-                visual_type = "Bar Chart"
-
-            formatted_columns = []
-            for col in sorted(bound_columns):
-                table_match = next(iter(used_tables), None)
-                formatted_columns.append({
-                    "table": table_match,
-                    "column": col
-                })
+                if worksheet.find(".//style-rule[@element='map']") is not None:
+                    visual_type = "Map"
+                elif worksheet.find(".//style-rule[@element='table']") is not None:
+                    visual_type = "Text Table"
+            
+            # C. Guess based on columns
+            if visual_type == "Automatic":
+                col_list_lower = [c['column'].lower() for c in bound_columns_data]
+                map_keywords = ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']
+                
+                if any(k in col for col in col_list_lower for k in map_keywords):
+                    visual_type = "Map"
+                elif len(bound_columns_data) == 1:
+                    visual_type = "Text Table"
+                else:
+                    visual_type = "Bar Chart"
 
             metadata["worksheets"].append({
                 "name": sheet_name,
-                "visualType": visual_type,
-                "markClass": mark_class,
-                "confidenceScore": round(0.6 if mark_class != "Automatic" else 0.4, 2),
-                "usedTables": sorted(list(used_tables)),
-                "hasCalculatedFields": any(
-                    col in [c["name"] for c in metadata["calculatedFields"]]
-                    for col in bound_columns
-                ),
-                "columns": formatted_columns
+                "visualType": visual_type, 
+                "columns": bound_columns_data
             })
 
-        # -------------------------------
-        # DASHBOARDS
-        # -------------------------------
+        # ---------------------------------------------
+        # 4. DASHBOARDS
+        # ---------------------------------------------
         for dashboard in root.findall(".//dashboard"):
             ws_names = []
             for zone in dashboard.findall(".//zone"):
-                if zone.get("name"):
-                    ws_names.append(zone.get("name"))
-
+                z_name = zone.get("name")
+                if z_name:
+                    ws_names.append(z_name)
+            
             metadata["dashboards"].append({
                 "dashboardName": dashboard.get("name"),
                 "worksheets": list(set(ws_names))
@@ -566,26 +667,32 @@ def handle_extraction(payload: ExtractMetadataRequest):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_twbx = os.path.join(tmpdir, "input.twbx")
-
+            
+            # Download
             download_blob_to_file(payload.inputBlobUrl, local_twbx)
+            
+            # Extract
             metadata = extract_tableau_metadata(local_twbx)
-
+            
+            # Upload
             base_name = unquote(os.path.basename(payload.inputBlobUrl))
             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
-
+            
             output_url = upload_json_to_blob(
                 payload.outputContainerUrl,
                 output_name,
                 metadata
             )
-
+            
         return {
             "status": "success",
             "outputBlobUrl": output_url,
-            "visuals_found": len(metadata["worksheets"])
+            "visuals_found": len(metadata["worksheets"]),
+            "datasource_type": metadata["dataSource"].get("type", "unknown")
         }
 
     except Exception as e:
+        # Log error here in a real app
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
