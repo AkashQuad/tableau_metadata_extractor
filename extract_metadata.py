@@ -1,3 +1,322 @@
+# import json
+# import os
+# import zipfile
+# import tempfile
+# import re
+# import xml.etree.ElementTree as ET
+# from urllib.parse import unquote
+
+# # Third-party imports
+# from fastapi import FastAPI, HTTPException
+# from fastapi.middleware.cors import CORSMiddleware
+# from pydantic import BaseModel
+# from azure.storage.blob import BlobClient
+
+# # Initialize App
+# app = FastAPI(title="Tableau Metadata Extractor API")
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # -------------------------------------------------
+# # CONSTANTS & MODELS
+# # -------------------------------------------------
+
+# MARK_MAP = {
+#     'bar': 'Bar Chart',
+#     'line': 'Line Chart',
+#     'area': 'Area Chart',
+#     'text': 'Text Table',
+#     'circle': 'Scatter Plot',
+#     'square': 'Heat Map',
+#     'pie': 'Pie Chart',
+#     'map': 'Map',
+#     'ganttbar': 'Gantt Chart',
+#     'shape': 'Shape Chart',
+#     'scatter': 'Scatter Plot',
+#     'multipolygon': 'Map',
+#     'filledmap': 'Map'
+# }
+
+# class ExtractMetadataRequest(BaseModel):
+#     inputBlobUrl: str
+#     outputContainerUrl: str
+
+# # -------------------------------------------------
+# # HELPERS
+# # -------------------------------------------------
+
+# def clean_name(name: str) -> str:
+#     """
+#     Cleans Tableau field names.
+#     """
+#     if not name:
+#         return ""
+    
+#     # 1. Remove brackets
+#     name = name.replace("[", "").replace("]", "")
+    
+#     # 2. Remove Tableau internal patterns (start prefixes)
+#     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
+    
+#     # 3. Remove internal suffixes
+#     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
+    
+#     return name
+
+# def get_blob_client(blob_url: str):
+#     """
+#     Helper to get a BlobClient. 
+#     Tries to use Connection String if available to handle Auth,
+#     otherwise falls back to the URL (assuming SAS token exists).
+#     """
+#     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    
+#     # If we have a connection string, parse the blob name/container from the URL
+#     # to ensure we use the authenticated client.
+#     if conn_str:
+#         try:
+#             # Logic to parse container and blob name from URL if needed
+#             # For simplicity, we assume if conn_str exists, we prefer it.
+#             # However, mapping a full URL to a client via conn string requires parsing.
+#             # If the URL is external (SAS), use from_blob_url.
+#             return BlobClient.from_blob_url(blob_url) 
+#         except Exception:
+#             pass
+            
+#     # Fallback to URL (Must have SAS token if private)
+#     return BlobClient.from_blob_url(blob_url)
+
+# def download_blob_to_file(blob_url: str, local_path: str):
+#     # NOTE: If your blob is private, blob_url MUST include a SAS token
+#     # OR you must use a credential object here.
+#     blob = BlobClient.from_blob_url(blob_url)
+    
+#     # If using Managed Identity or Connection String for the input too:
+#     # blob = BlobClient.from_connection_string(conn_str, container, blob_name)
+    
+#     with open(local_path, "wb") as f:
+#         data = blob.download_blob()
+#         data.readinto(f)
+
+# def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
+#     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+#     if not conn_str:
+#         raise ValueError("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
+
+#     # specific parsing to get container name roughly
+#     # container_url input might be https://account.blob.core.windows.net/container
+#     container_name = container_url.rstrip("/").split("/")[-1]
+    
+#     blob = BlobClient.from_connection_string(
+#         conn_str=conn_str,
+#         container_name=container_name,
+#         blob_name=blob_name
+#     )
+#     blob.upload_blob(
+#         json.dumps(data, indent=2),
+#         overwrite=True,
+#         content_type="application/json"
+#     )
+#     return blob.url
+
+# # -------------------------------------------------
+# # CORE EXTRACTION LOGIC
+# # -------------------------------------------------
+
+# def extract_tableau_metadata(twbx_path: str) -> dict:
+#     metadata = {
+#         "dataSource": {},
+#         "calculatedFields": [],
+#         "worksheets": [],
+#         "dashboards": [],
+#         "globalFilters": []
+#     }
+
+#     with tempfile.TemporaryDirectory() as tmpdir:
+#         # A. Unzip TWBX
+#         try:
+#             with zipfile.ZipFile(twbx_path, "r") as zip_ref:
+#                 zip_ref.extractall(tmpdir)
+#         except zipfile.BadZipFile:
+#             raise ValueError("File is not a valid .twbx zip file")
+
+#         # B. Find .twb XML
+#         twb_file = None
+#         for root_dir, _, files in os.walk(tmpdir):
+#             for file in files:
+#                 if file.endswith(".twb"):
+#                     twb_file = os.path.join(root_dir, file)
+#                     break
+        
+#         if not twb_file:
+#             raise ValueError("No .twb XML file found inside TWBX")
+
+#         # C. Parse XML & STRIP NAMESPACES
+#         try:
+#             tree = ET.parse(twb_file)
+#             root = tree.getroot()
+#         except ET.ParseError:
+#             raise ValueError("Failed to parse .twb XML content")
+        
+#         # Namespace stripping
+#         for elem in root.iter():
+#             if '}' in elem.tag:
+#                 elem.tag = elem.tag.split('}', 1)[1]
+
+#         # 1. DATASOURCE
+#         datasource = root.find(".//datasource")
+#         if datasource is not None:
+#             tables = []
+#             for relation in datasource.findall(".//relation"):
+#                 table_name = relation.get("table")
+#                 if not table_name: 
+#                     continue
+                
+#                 tables.append({
+#                     "tableName": clean_name(table_name),
+#                     "columns": [] 
+#                 })
+
+#             metadata["dataSource"] = {
+#                 "name": datasource.get("name") or "TableauData",
+#                 "type": "extract",
+#                 "tables": tables
+#             }
+
+#         # 2. CALCULATED FIELDS
+#         for col in root.findall(".//column"):
+#             calc = col.find("calculation")
+#             if calc is not None:
+#                 metadata["calculatedFields"].append({
+#                     "name": clean_name(col.get("name")),
+#                     "expression": calc.get("formula")
+#                 })
+
+#         # 3. WORKSHEETS
+#         for worksheet in root.findall(".//worksheet"):
+#             sheet_name = worksheet.get('name')
+#             bound_columns_set = set()
+
+#             # Dependency Detection
+#             for dep in worksheet.findall(".//datasource-dependencies"):
+#                 for col in dep.findall("column-instance"):
+#                     col_ref = col.get('column')
+#                     clean_col = None
+                    
+#                     if col_ref:
+#                         # [some_table].[column_name] -> column_name
+#                         parts = col_ref.split(']:')
+#                         if len(parts) > 1:
+#                             clean_col = clean_name(parts[-1])
+                    
+#                     if not clean_col: 
+#                         clean_col = clean_name(col.get('name'))
+                        
+#                     if clean_col:
+#                         bound_columns_set.add(clean_col)
+
+#             # Smart Visual Detection
+#             visual_type = "Automatic"
+            
+#             # A. Check Marks
+#             for mark_element in worksheet.findall(".//pane/mark"):
+#                 cls = mark_element.get('class')
+#                 if cls and cls != "Automatic":
+#                     visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
+#                     break
+            
+#             # B. Check Style Rules
+#             if visual_type == "Automatic":
+#                 if worksheet.find(".//style-rule[@element='map']") is not None:
+#                     visual_type = "Map"
+#                 elif worksheet.find(".//style-rule[@element='table']") is not None:
+#                     visual_type = "Text Table"
+            
+#             # C. Guess based on columns
+#             if visual_type == "Automatic":
+#                 col_list_lower = [c.lower() for c in bound_columns_set]
+#                 map_keywords = ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']
+                
+#                 if any(k in col for col in col_list_lower for k in map_keywords):
+#                     visual_type = "Map"
+#                 elif len(bound_columns_set) == 1:
+#                     visual_type = "Text Table"
+#                 else:
+#                     visual_type = "Bar Chart"
+
+#             formatted_columns = [
+#                 {"table": "MainTable", "column": col} 
+#                 for col in sorted(list(bound_columns_set))
+#             ]
+
+#             metadata["worksheets"].append({
+#                 "name": sheet_name,
+#                 "visualType": visual_type, 
+#                 "columns": formatted_columns
+#             })
+
+#         # 4. DASHBOARDS
+#         for dashboard in root.findall(".//dashboard"):
+#             ws_names = []
+#             for zone in dashboard.findall(".//zone"):
+#                 z_name = zone.get("name")
+#                 if z_name:
+#                     ws_names.append(z_name)
+            
+#             metadata["dashboards"].append({
+#                 "dashboardName": dashboard.get("name"),
+#                 "worksheets": list(set(ws_names))
+#             })
+
+#     return metadata
+
+# # -------------------------------------------------
+# # API ENDPOINT
+# # -------------------------------------------------
+
+# @app.post("/extract-metadata")
+# def handle_extraction(payload: ExtractMetadataRequest):
+#     try:
+#         with tempfile.TemporaryDirectory() as tmpdir:
+#             local_twbx = os.path.join(tmpdir, "input.twbx")
+            
+#             # Download
+#             download_blob_to_file(payload.inputBlobUrl, local_twbx)
+            
+#             # Extract
+#             metadata = extract_tableau_metadata(local_twbx)
+            
+#             # Upload
+#             base_name = unquote(os.path.basename(payload.inputBlobUrl))
+#             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
+            
+#             output_url = upload_json_to_blob(
+#                 payload.outputContainerUrl,
+#                 output_name,
+#                 metadata
+#             )
+            
+#         return {
+#             "status": "success",
+#             "outputBlobUrl": output_url,
+#             "visuals_found": len(metadata["worksheets"])
+#         }
+
+#     except Exception as e:
+#         # Log error here in a real app
+#         raise HTTPException(status_code=500, detail=str(e))
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
 import json
 import os
 import zipfile
@@ -12,7 +331,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from azure.storage.blob import BlobClient
 
+# -------------------------------------------------
 # Initialize App
+# -------------------------------------------------
 app = FastAPI(title="Tableau Metadata Extractor API")
 
 app.add_middleware(
@@ -48,7 +369,7 @@ class ExtractMetadataRequest(BaseModel):
     outputContainerUrl: str
 
 # -------------------------------------------------
-# HELPERS
+# HELPERS (EXISTING)
 # -------------------------------------------------
 
 def clean_name(name: str) -> str:
@@ -57,49 +378,15 @@ def clean_name(name: str) -> str:
     """
     if not name:
         return ""
-    
-    # 1. Remove brackets
+
     name = name.replace("[", "").replace("]", "")
-    
-    # 2. Remove Tableau internal patterns (start prefixes)
     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc):', '', name, flags=re.IGNORECASE)
-    
-    # 3. Remove internal suffixes
     name = re.sub(r':(nk|ok|qk|sk)$', '', name, flags=re.IGNORECASE)
-    
+
     return name
 
-def get_blob_client(blob_url: str):
-    """
-    Helper to get a BlobClient. 
-    Tries to use Connection String if available to handle Auth,
-    otherwise falls back to the URL (assuming SAS token exists).
-    """
-    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    
-    # If we have a connection string, parse the blob name/container from the URL
-    # to ensure we use the authenticated client.
-    if conn_str:
-        try:
-            # Logic to parse container and blob name from URL if needed
-            # For simplicity, we assume if conn_str exists, we prefer it.
-            # However, mapping a full URL to a client via conn string requires parsing.
-            # If the URL is external (SAS), use from_blob_url.
-            return BlobClient.from_blob_url(blob_url) 
-        except Exception:
-            pass
-            
-    # Fallback to URL (Must have SAS token if private)
-    return BlobClient.from_blob_url(blob_url)
-
 def download_blob_to_file(blob_url: str, local_path: str):
-    # NOTE: If your blob is private, blob_url MUST include a SAS token
-    # OR you must use a credential object here.
     blob = BlobClient.from_blob_url(blob_url)
-    
-    # If using Managed Identity or Connection String for the input too:
-    # blob = BlobClient.from_connection_string(conn_str, container, blob_name)
-    
     with open(local_path, "wb") as f:
         data = blob.download_blob()
         data.readinto(f)
@@ -109,27 +396,118 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     if not conn_str:
         raise ValueError("AZURE_STORAGE_CONNECTION_STRING environment variable not set")
 
-    # specific parsing to get container name roughly
-    # container_url input might be https://account.blob.core.windows.net/container
     container_name = container_url.rstrip("/").split("/")[-1]
-    
+
     blob = BlobClient.from_connection_string(
         conn_str=conn_str,
         container_name=container_name,
         blob_name=blob_name
     )
+
     blob.upload_blob(
         json.dumps(data, indent=2),
         overwrite=True,
         content_type="application/json"
     )
+
     return blob.url
 
 # -------------------------------------------------
-# CORE EXTRACTION LOGIC
+# NEW SEMANTIC EXTRACTION HELPERS (PHASE 2)
+# -------------------------------------------------
+
+def extract_tables_and_columns(root):
+    """
+    Extracts physical tables and columns for semantic model generation.
+    """
+    tables = {}
+
+    for datasource in root.findall(".//datasource"):
+        for relation in datasource.findall(".//relation"):
+            table_raw = relation.get("name") or relation.get("table")
+            table_name = clean_name(table_raw)
+
+            if table_name not in tables:
+                tables[table_name] = {
+                    "tableName": table_name,
+                    "columns": []
+                }
+
+            for col in relation.findall(".//column"):
+                tables[table_name]["columns"].append({
+                    "name": clean_name(col.get("name")),
+                    "tableDataType": col.get("datatype"),
+                    "ordinal": col.get("ordinal")
+                })
+
+    return list(tables.values())
+
+def extract_aggregation_hints(root):
+    """
+    Extracts Tableau aggregation intent (Sum, Count, Year, etc.)
+    for later DAX translation.
+    """
+    aggregations = {}
+
+    for col in root.findall(".//column"):
+        name = clean_name(col.get("name"))
+        agg = col.get("aggregation")
+        if agg:
+            aggregations[name] = agg
+
+    return aggregations
+
+def infer_relationships(tables):
+    """
+    Infers relationships using shared column names across tables.
+    """
+    column_index = {}
+
+    for table in tables:
+        for col in table["columns"]:
+            column_index.setdefault(col["name"], []).append(table["tableName"])
+
+    relationships = []
+
+    for column, table_list in column_index.items():
+        if len(table_list) == 2:
+            relationships.append({
+                "fromTable": table_list[1],
+                "fromColumn": column,
+                "toTable": table_list[0],
+                "toColumn": column,
+                "cardinality": "ManyToOne",
+                "crossFilteringBehavior": "OneDirection"
+            })
+
+    return relationships
+
+def detect_fact_tables(tables):
+    """
+    Heuristic detection of fact tables.
+    """
+    facts = []
+
+    for table in tables:
+        numeric_cols = [
+            c for c in table["columns"]
+            if c["tableDataType"] in ("real", "integer", "float", "double")
+        ]
+        if numeric_cols:
+            facts.append(table["tableName"])
+
+    return facts
+
+# -------------------------------------------------
+# CORE EXTRACTION LOGIC (EXISTING + EXTENDED)
 # -------------------------------------------------
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
+    """
+    Extracts Tableau metadata for visuals AND semantic model generation.
+    Existing visual metadata is preserved as-is.
+    """
+
     metadata = {
         "dataSource": {},
         "calculatedFields": [],
@@ -140,47 +518,40 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # A. Unzip TWBX
-        try:
-            with zipfile.ZipFile(twbx_path, "r") as zip_ref:
-                zip_ref.extractall(tmpdir)
-        except zipfile.BadZipFile:
-            raise ValueError("File is not a valid .twbx zip file")
+        with zipfile.ZipFile(twbx_path, "r") as zip_ref:
+            zip_ref.extractall(tmpdir)
 
-        # B. Find .twb XML
+        # B. Find TWB
         twb_file = None
         for root_dir, _, files in os.walk(tmpdir):
             for file in files:
                 if file.endswith(".twb"):
                     twb_file = os.path.join(root_dir, file)
                     break
-        
-        if not twb_file:
-            raise ValueError("No .twb XML file found inside TWBX")
 
-        # C. Parse XML & STRIP NAMESPACES
-        try:
-            tree = ET.parse(twb_file)
-            root = tree.getroot()
-        except ET.ParseError:
-            raise ValueError("Failed to parse .twb XML content")
-        
-        # Namespace stripping
+        if not twb_file:
+            raise ValueError("No .twb file found")
+
+        # C. Parse XML
+        tree = ET.parse(twb_file)
+        root = tree.getroot()
+
+        # Strip namespaces
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
-        # 1. DATASOURCE
+        # -------------------------------------------------
+        # EXISTING VISUAL METADATA (UNCHANGED)
+        # -------------------------------------------------
+
         datasource = root.find(".//datasource")
         if datasource is not None:
             tables = []
             for relation in datasource.findall(".//relation"):
-                table_name = relation.get("table")
-                if not table_name: 
-                    continue
-                
                 tables.append({
-                    "tableName": clean_name(table_name),
-                    "columns": [] 
+                    "tableName": clean_name(relation.get("table")),
+                    "columns": []
                 })
 
             metadata["dataSource"] = {
@@ -189,7 +560,6 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 "tables": tables
             }
 
-        # 2. CALCULATED FIELDS
         for col in root.findall(".//column"):
             calc = col.find("calculation")
             if calc is not None:
@@ -198,81 +568,47 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     "expression": calc.get("formula")
                 })
 
-        # 3. WORKSHEETS
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
             bound_columns_set = set()
 
-            # Dependency Detection
             for dep in worksheet.findall(".//datasource-dependencies"):
                 for col in dep.findall("column-instance"):
-                    col_ref = col.get('column')
-                    clean_col = None
-                    
-                    if col_ref:
-                        # [some_table].[column_name] -> column_name
-                        parts = col_ref.split(']:')
-                        if len(parts) > 1:
-                            clean_col = clean_name(parts[-1])
-                    
-                    if not clean_col: 
-                        clean_col = clean_name(col.get('name'))
-                        
+                    clean_col = clean_name(col.get('column') or col.get('name'))
                     if clean_col:
                         bound_columns_set.add(clean_col)
 
-            # Smart Visual Detection
             visual_type = "Automatic"
-            
-            # A. Check Marks
-            for mark_element in worksheet.findall(".//pane/mark"):
-                cls = mark_element.get('class')
-                if cls and cls != "Automatic":
-                    visual_type = MARK_MAP.get(cls.lower(), cls.capitalize())
-                    break
-            
-            # B. Check Style Rules
-            if visual_type == "Automatic":
-                if worksheet.find(".//style-rule[@element='map']") is not None:
-                    visual_type = "Map"
-                elif worksheet.find(".//style-rule[@element='table']") is not None:
-                    visual_type = "Text Table"
-            
-            # C. Guess based on columns
-            if visual_type == "Automatic":
-                col_list_lower = [c.lower() for c in bound_columns_set]
-                map_keywords = ['lat', 'lon', 'country', 'city', 'state', 'zip', 'geo']
-                
-                if any(k in col for col in col_list_lower for k in map_keywords):
-                    visual_type = "Map"
-                elif len(bound_columns_set) == 1:
-                    visual_type = "Text Table"
-                else:
-                    visual_type = "Bar Chart"
-
-            formatted_columns = [
-                {"table": "MainTable", "column": col} 
-                for col in sorted(list(bound_columns_set))
-            ]
+            for mark in worksheet.findall(".//pane/mark"):
+                cls = mark.get('class')
+                if cls:
+                    visual_type = MARK_MAP.get(cls.lower(), cls)
 
             metadata["worksheets"].append({
                 "name": sheet_name,
-                "visualType": visual_type, 
-                "columns": formatted_columns
+                "visualType": visual_type,
+                "columns": [{"table": "MainTable", "column": c} for c in sorted(bound_columns_set)]
             })
 
-        # 4. DASHBOARDS
         for dashboard in root.findall(".//dashboard"):
-            ws_names = []
-            for zone in dashboard.findall(".//zone"):
-                z_name = zone.get("name")
-                if z_name:
-                    ws_names.append(z_name)
-            
             metadata["dashboards"].append({
                 "dashboardName": dashboard.get("name"),
-                "worksheets": list(set(ws_names))
+                "worksheets": list(set(
+                    z.get("name") for z in dashboard.findall(".//zone") if z.get("name")
+                ))
             })
+
+        # -------------------------------------------------
+        # NEW SEMANTIC MODEL METADATA (PHASE 2)
+        # -------------------------------------------------
+
+        semantic_tables = extract_tables_and_columns(root)
+        metadata["semanticModel"] = {
+            "tables": semantic_tables,
+            "relationships": infer_relationships(semantic_tables),
+            "aggregationHints": extract_aggregation_hints(root),
+            "factTables": detect_fact_tables(semantic_tables)
+        }
 
     return metadata
 
@@ -285,33 +621,33 @@ def handle_extraction(payload: ExtractMetadataRequest):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_twbx = os.path.join(tmpdir, "input.twbx")
-            
-            # Download
+
             download_blob_to_file(payload.inputBlobUrl, local_twbx)
-            
-            # Extract
             metadata = extract_tableau_metadata(local_twbx)
-            
-            # Upload
+
             base_name = unquote(os.path.basename(payload.inputBlobUrl))
             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
-            
+
             output_url = upload_json_to_blob(
                 payload.outputContainerUrl,
                 output_name,
                 metadata
             )
-            
+
         return {
             "status": "success",
             "outputBlobUrl": output_url,
-            "visuals_found": len(metadata["worksheets"])
+            "visuals_found": len(metadata["worksheets"]),
+            "tables_found": len(metadata.get("semanticModel", {}).get("tables", []))
         }
 
     except Exception as e:
-        # Log error here in a real app
         raise HTTPException(status_code=500, detail=str(e))
 
+# -------------------------------------------------
+# LOCAL DEV
+# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
