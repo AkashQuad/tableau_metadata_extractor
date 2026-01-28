@@ -317,7 +317,6 @@
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
-
 import json
 import os
 import zipfile
@@ -347,7 +346,7 @@ app.add_middleware(
 # CONSTANTS & MODELS
 # -------------------------------------------------
 
-# Preserving your exact Visual Mapping
+# EXACT VISUAL MAPPING PRESERVED
 MARK_MAP = {
     'bar': 'Bar Chart',
     'line': 'Line Chart',
@@ -391,9 +390,6 @@ def clean_name(name: str) -> str:
     return name
 
 def get_blob_client(blob_url: str):
-    """
-    Helper to get a BlobClient. 
-    """
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
     if conn_str:
         try:
@@ -410,12 +406,8 @@ def download_blob_to_file(blob_url: str, local_path: str):
 
 def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
     conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    # In production, ensure this env var is set
-    # if not conn_str: raise ValueError("AZURE_STORAGE_CONNECTION_STRING not set")
-
     try:
         container_name = container_url.rstrip("/").split("/")[-1]
-        
         blob = BlobClient.from_connection_string(
             conn_str=conn_str,
             container_name=container_name,
@@ -428,7 +420,6 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
         )
         return blob.url
     except Exception as e:
-        # Fallback for local testing or if connection string fails
         print(f"Upload warning (Mock URL returned): {str(e)}")
         return f"{container_url}/{blob_name}"
 
@@ -438,7 +429,6 @@ def upload_json_to_blob(container_url: str, blob_name: str, data: dict) -> str:
 
 def extract_tableau_metadata(twbx_path: str) -> dict:
     metadata = {
-        # Changed to LIST to support multiple datasources (Relations)
         "dataSources": [], 
         "calculatedFields": [],
         "worksheets": [],
@@ -472,30 +462,26 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
         except ET.ParseError:
             raise ValueError("Failed to parse .twb XML content")
         
-        # Namespace stripping
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
 
         # ---------------------------------------------
-        # 1. DATASOURCES & RELATIONS (Fixed)
+        # 1. DATASOURCES (With Deduplication Fix)
         # ---------------------------------------------
-        # Map to store datasource details for lookup during worksheet processing
         global_ds_lookup = {} 
 
-        # We loop through ALL datasources to capture every relation
         for datasource in root.findall("datasources/datasource"):
-            
-            ds_name = datasource.get("name") # Technical ID (e.g. federated.0gc...)
-            ds_caption = datasource.get("caption", ds_name) # User-friendly name (e.g. Orders)
+            ds_name = datasource.get("name") 
+            ds_caption = datasource.get("caption", ds_name)
 
             ds_info = {
                 "name": ds_name,
                 "caption": ds_caption,
                 "type": "extract",
-                "tables": [],      # This will hold your RELATIONS
+                "tables": [],
                 "connectionInfo": {},
-                "rawColumns": {}   # Helper for datatype lookups
+                "rawColumns": {}
             }
 
             # Extract Connection Details
@@ -509,21 +495,25 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 }
                 ds_info["type"] = connection.get("class", "extract")
 
-            # --- EXTRACT RELATIONS (The Logic You Requested) ---
-            # We use .//relation to find all tables, joins, and unions recursively.
+            # --- RELATION EXTRACTION (FIXED) ---
+            seen_tables = set() # Set to track duplicates within this datasource
+
             for relation in datasource.findall(".//relation"):
-                # "table" attribute usually holds the physical table name [orders#csv]
                 table_name = relation.get("table")
-                
-                # "name" attribute holds the logical name (e.g. Orders.csv)
                 if not table_name:
                     table_name = relation.get("name") 
 
                 if table_name: 
                     clean_tbl = clean_name(table_name)
                     
-                    # We capture the 'type'. If it is a join, type='join'. 
-                    # If it's a table, type='table'.
+                    # DEDUPLICATION CHECK:
+                    # Tableau XML often repeats relation definitions in 'connection' and 'object-graph'.
+                    # We skip if we've already processed this table name.
+                    if clean_tbl in seen_tables:
+                        continue
+                    
+                    seen_tables.add(clean_tbl)
+
                     relation_type = relation.get("type", "table")
                     
                     ds_info["tables"].append({
@@ -532,7 +522,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                         "type": relation_type
                     })
 
-            # Extract Column Definitions (Data Dictionary)
+            # Extract Column Definitions
             for col in datasource.findall(".//column"):
                 col_name = col.get("name")
                 if col_name:
@@ -544,16 +534,14 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                         "caption": col.get("caption", clean_col)
                     }
             
-            # Add to main metadata list
             metadata["dataSources"].append({
                 "name": ds_info["name"],
                 "caption": ds_info["caption"],
                 "type": ds_info["type"],
-                "tables": ds_info["tables"], # Relations are here
+                "tables": ds_info["tables"],
                 "connection": ds_info["connectionInfo"]
             })
 
-            # Store for Worksheet Lookup
             global_ds_lookup[ds_name] = ds_info
 
         # ---------------------------------------------
@@ -571,16 +559,13 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                 })
 
         # ---------------------------------------------
-        # 3. WORKSHEETS (Visuals & Data Mapping Preserved)
+        # 3. WORKSHEETS (Exact Visual Logic Preserved)
         # ---------------------------------------------
         for worksheet in root.findall(".//worksheet"):
             sheet_name = worksheet.get('name')
             bound_columns_data = [] 
 
-            # Process Dependencies (Links worksheets to specific datasources)
             for dep in worksheet.findall(".//datasource-dependencies"):
-                
-                # Identify which datasource is being used here
                 ds_ref = dep.get("datasource") 
                 current_ds_info = global_ds_lookup.get(ds_ref)
                 
@@ -593,26 +578,22 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                     clean_col = None
                     detected_table = None
 
-                    # Strategy A: Parse [Table].[Column]
                     if col_ref and '].[' in col_ref:
                         match = re.search(r'^\[(.*?)\]\.\[(.*?)\]', col_ref)
                         if match:
                             detected_table = clean_name(match.group(1))
                             clean_col = clean_name(match.group(2))
                     
-                    # Strategy B: Fallback
                     if not clean_col:
                         clean_col = clean_name(raw_col_name)
 
                     if clean_col:
                         col_meta = current_ds_info["rawColumns"].get(clean_col, {})
                         
-                        # Resolve Table Name
                         final_table_name = "Extract"
                         if detected_table:
                             final_table_name = detected_table
                         elif current_ds_info["tables"]:
-                            # Use the first table of the CORRECT datasource
                             final_table_name = current_ds_info["tables"][0]["tableName"]
                         
                         if not any(x['column'] == clean_col for x in bound_columns_data):
@@ -624,7 +605,7 @@ def extract_tableau_metadata(twbx_path: str) -> dict:
                                 "role": col_meta.get("role", "dimension")
                             })
 
-            # --- VISUAL DETECTION (Preserved Exact Logic) ---
+            # --- VISUAL DETECTION LOGIC (PRESERVED) ---
             visual_type = "Automatic"
             
             # A. Check Marks
@@ -685,14 +666,9 @@ def handle_extraction(payload: ExtractMetadataRequest):
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             local_twbx = os.path.join(tmpdir, "input.twbx")
-            
-            # Download
             download_blob_to_file(payload.inputBlobUrl, local_twbx)
-            
-            # Extract
             metadata = extract_tableau_metadata(local_twbx)
             
-            # Upload
             base_name = unquote(os.path.basename(payload.inputBlobUrl))
             output_name = os.path.splitext(base_name)[0] + "_metadata.json"
             
